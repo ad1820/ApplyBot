@@ -29,10 +29,15 @@ logger = get_logger(__name__)
 
 app = FastAPI(title="Job Application Agent", version="0.1.0")
 
+# Bumped whenever a deploy-verification is needed - lets us confirm via
+# GET /health that a given Render deploy actually picked up the latest
+# code, rather than guessing from indirect behavior.
+_BUILD_MARKER = "webhook-hardening-2026-08-18"
+
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    status: dict[str, Any] = {"status": "ok"}
+    status: dict[str, Any] = {"status": "ok", "build": _BUILD_MARKER}
 
     if settings.supabase_configured():
         try:
@@ -68,25 +73,28 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
     if not settings.telegram_configured():
         raise HTTPException(status_code=503, detail="Telegram not configured")
 
-    from app.telegram.bot import TelegramBot
-    from app.telegram.handlers import build_bot_context_from_settings, dispatch_command
-
-    payload = await request.json()
-    message = payload.get("message")
-    if not message or "text" not in message:
-        # Non-text updates (edited messages, callback queries, etc.) are
-        # acknowledged but not acted on for now.
-        return {"ok": True}
-
-    chat_id = str(message["chat"]["id"])
+    # Everything below is wrapped in one broad try/except - a webhook
+    # handler must NEVER return a non-2xx response to Telegram for any
+    # reason (malformed/unexpected payload shape, a Supabase/LLM hiccup,
+    # etc.), since Telegram will otherwise retry the same update
+    # indefinitely and/or mark the webhook as failing.
     try:
+        from app.telegram.bot import TelegramBot
+        from app.telegram.handlers import build_bot_context_from_settings, dispatch_command
+
+        payload = await request.json()
+        message = payload.get("message")
+        if not message or "text" not in message:
+            # Non-text updates (edited messages, callback queries, etc.)
+            # are acknowledged but not acted on for now.
+            return {"ok": True}
+
+        chat_id = str(message["chat"]["id"])
         ctx = build_bot_context_from_settings()
         reply = dispatch_command(ctx, message["text"])
         bot = TelegramBot(settings.telegram_bot_token)
         bot.send_message(chat_id, reply)
-    except Exception as exc:  # noqa: BLE001 - a webhook handler must never
-        # 500 back to Telegram (Telegram would retry indefinitely); log and
-        # acknowledge instead.
-        logger.error("Failed to handle telegram webhook update: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - see comment above
+        logger.error("Failed to handle telegram webhook update: %s", exc, exc_info=True)
 
     return {"ok": True}

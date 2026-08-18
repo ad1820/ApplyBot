@@ -198,17 +198,24 @@ This section covers deploying the agent so it runs unattended: a scheduled
 discovery job, an always-listening Telegram bot, and persistent state that
 survives restarts/redeploys. See `HOW_TO_RUN.md` for local development.
 
-Three platform-specific, copy-paste-ready deployment guides are also
-available:
-- **`SUPABASE_DEPLOYMENT.md`** — schedule discovery via Supabase Cron
-  (`pg_cron`/`pg_net`) calling your app's HTTP endpoint.
-- **`NORTHFLANK_DEPLOYMENT.md`** — host the FastAPI app, Telegram poller,
-  and scheduled discovery entirely on Northflank (Services + a native Cron
-  Job running `scripts/run_discovery.py` directly, no HTTP hop needed).
-- **`RENDER_DEPLOYMENT.md`** — host the FastAPI app (Web Service), Telegram
-  poller (Background Worker), and scheduled discovery (Cron Job) entirely
-  on Render, with notes on Render's free-tier scope and UTC-only cron
-  scheduling.
+**Recommended setup (fully free-tier):** Supabase hosts the database and
+the scheduler (`pg_cron`/`pg_net`), and a single free Render Web Service
+(or any host with a free always-on web tier - Railway, Fly.io, etc.) runs
+the FastAPI app. Telegram delivers commands via **webhook** straight to
+that same Web Service (`POST /telegram/webhook`), and Supabase Cron
+triggers scheduled discovery via HTTPS (`POST /run/job-search`) - so
+**no paid Background Worker or Cron Job is required anywhere**. This
+avoids needing a second always-on process, which many hosting providers'
+free tiers don't include (e.g. Render's free tier only covers Web
+Services).
+
+If your host *does* offer a free/cheap always-on worker or native Cron
+Job, you can instead run `scripts/telegram_polling.py` as a second process
+and/or point a native scheduler directly at `scripts/run_discovery.py` -
+both paths share the exact same underlying logic
+(`app.telegram.handlers.dispatch_command` and
+`app.agents.job_agent.run_job_search` respectively), so behavior is
+identical either way.
 
 ## 11. Prerequisites for Production
 
@@ -285,55 +292,83 @@ them into the image.
 
 ## 16. Run the Telegram Bot Process
 
-The FastAPI container serves HTTP endpoints only — it does **not** by
-itself listen for Telegram messages. You need one more always-running
-process for that. Two options:
+**Option A — Webhook (recommended, no extra process needed)**
 
-**Option A — Long-polling worker (simplest)**
+`POST /telegram/webhook` is fully wired up: it dispatches every command
+through `app.telegram.handlers.dispatch_command` and replies via Telegram,
+using the exact same logic as the polling script. Just point Telegram's
+webhook at your deployed FastAPI Web Service:
 
-Run `scripts/telegram_polling.py` as a second, always-on process (e.g. a
-second container, a systemd service, or a background worker on your
-hosting platform):
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<your-host>/telegram/webhook"
+curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"   # verify: no last_error_message
+```
+
+This is the best option when your hosting plan has no free always-on
+worker process (e.g. Render's free tier only covers Web Services) - the
+same Web Service that serves `/health` and `/run/job-search` also handles
+the bot, with zero extra infrastructure.
+
+**Option B — Long-polling worker (if you have a free/cheap always-on process)**
+
+Run `scripts/telegram_polling.py` as a second, always-on process (a second
+container, a systemd service, a Background Worker, etc.):
 
 ```bash
 python scripts/telegram_polling.py
 ```
 
-This is the same script used in local development — it long-polls Telegram
-and dispatches every command. If it stops, restart it; there is no message
-loss risk because Telegram queues unfetched updates and this project's
-notification tracking (`notifications` table) prevents any duplicates once
-it resumes.
-
-**Option B — Webhook (more production-idiomatic)**
-
-Point Telegram's webhook at your deployed `POST /telegram/webhook`
-endpoint:
-
-```bash
-curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<your-host>/telegram/webhook"
-```
-
-Note: as shipped, `app/main.py`'s webhook handler only acknowledges receipt
-— full command dispatch through `app.telegram.handlers` currently only runs
-in the polling script. If you choose the webhook route, wire the same
-`dispatch()` logic from `scripts/telegram_polling.py` into
-`telegram_webhook()` in `app/main.py` before relying on it in production.
-Option A works out of the box with no changes.
+If you switch to this, first remove the webhook (`.../deleteWebhook`) -
+Telegram only delivers updates through one transport at a time. Only run
+**one** instance at a time either way; Telegram rejects concurrent
+`getUpdates` long-polling clients on the same bot token. There is no
+message-loss risk switching between the two: Telegram queues updates for
+a period if neither transport is active, and this project's notification
+tracking (`notifications` table) prevents duplicate job alerts once
+delivery resumes.
 
 ## 17. Schedule Job Discovery
 
-Point any scheduler at your deployed instance:
+**Recommended: Supabase Cron** (`pg_cron` + `pg_net`), since it is free
+and needs no extra hosting — Supabase's own Postgres instance triggers an
+HTTPS call to your deployed app on a schedule.
 
-```
-POST https://<your-host>/run/job-search
-Header: X-Scheduler-Secret: <your SCHEDULER_SECRET>
-```
+1. In the Supabase Dashboard → **Database** → **Extensions**, enable
+   `pg_cron` and `pg_net` (or via SQL: `create extension if not exists pg_cron;`
+   and `create extension if not exists pg_net;`).
+2. In the SQL Editor, schedule the trigger (replace the URL and secret with
+   your real values):
+   ```sql
+   select cron.schedule(
+     'daily-job-search',              -- job name (must be unique)
+     '30 2 * * *',                    -- cron syntax, ALWAYS IN UTC (e.g. 08:00 IST = 02:30 UTC)
+     $$
+     select net.http_post(
+       url := 'https://<your-host>/run/job-search',
+       headers := jsonb_build_object(
+         'Content-Type', 'application/json',
+         'X-Scheduler-Secret', '<your SCHEDULER_SECRET>'
+       ),
+       body := '{}'::jsonb,
+       timeout_milliseconds := 30000
+     ) as request_id;
+     $$
+   );
+   ```
+3. Verify it was scheduled: `select * from cron.job;`
+4. Inspect run history / debug failures:
+   `select * from cron.job_run_details where jobname = 'daily-job-search' order by start_time desc limit 10;`
+5. To change or remove it later: `select cron.unschedule('daily-job-search');`
+   then re-run `cron.schedule(...)` with new values.
 
-- **Supabase Cron** (via `pg_cron` + `pg_net`, or a Supabase Edge Function
-  on a schedule) calling the above endpoint.
-- **A cron job** on your host: `0 8 * * * curl -X POST ... -H "X-Scheduler-Secret: ..."`.
-- **GitHub Actions** scheduled workflow, or any third-party cron-as-a-service.
+**Alternatives** if you would rather not use Supabase Cron:
+- A cron job on your host: `0 8 * * * curl -X POST ... -H "X-Scheduler-Secret: ..."`.
+- GitHub Actions scheduled workflow, or any third-party cron-as-a-service,
+  calling the same endpoint.
+- If your host has a native, free Cron Job feature that can run a command
+  directly (not just an HTTP call), point it at
+  `python scripts/run_discovery.py` instead - it wraps the exact same
+  `run_job_search()` logic with no HTTP hop needed.
 
 Pick a cadence appropriate for the sources you use (e.g. once or twice
 daily) — remember RemoteOK/Remotive/etc. have their own rate-limit
@@ -365,20 +400,25 @@ Then trigger one discovery run manually and confirm:
 - **Google Sheets outages** never block the pipeline — check
   `agent_runs`/application logs for sync failures and re-sync manually if
   needed; Sheets is not the source of truth.
-- **Rotating secrets** — if you rotate `TELEGRAM_BOT_TOKEN`,
-  `SUPABASE_KEY`, or `LLM_API_KEY`, update `.env` and restart both the
-  FastAPI process and the polling process.
-- **Scaling** — this is designed for a single user; do not point multiple
-  Telegram polling processes at the same bot token simultaneously (Telegram
-  rejects concurrent `getUpdates` long-polling clients).
+- **Rotating secrets** — if you rotate `TELEGRAM_BOT_TOKEN`, `SUPABASE_KEY`,
+  or `LLM_API_KEY`, update your host's environment variables and redeploy
+  (and re-run `setWebhook` if `TELEGRAM_BOT_TOKEN` changes).
+- **Scaling** — this is designed for a single user; if you do run
+  `scripts/telegram_polling.py` instead of the webhook, only run one
+  instance at a time (Telegram rejects concurrent `getUpdates` long-polling
+  clients on the same bot token), and don't set a webhook simultaneously.
 
 ## 20. Production Troubleshooting
 
 - **`PGRST125` / "Invalid path"** → `SUPABASE_URL` has a trailing slash or
   `/rest/v1` suffix; also auto-normalized in `app/config.py`, but fix at the source.
-- **Telegram bot not responding** → confirm the polling process (or webhook)
-  is actually running; check `getUpdates` for a growing backlog as a sign
-  nothing is consuming it.
+- **Telegram bot not responding (webhook mode)** → check
+  `getWebhookInfo` for a `last_error_message`; confirm your deployed app is
+  reachable and `/telegram/webhook` returns 200; check your host's logs for
+  errors during `dispatch_command`.
+- **Telegram bot not responding (polling mode)** → confirm
+  `scripts/telegram_polling.py` is still running as a live process, and
+  that no webhook is also set (`getWebhookInfo` should show an empty `url`).
 - **Google Sheets `403`/API-disabled** → share the sheet with the service
   account's `client_email` as Editor, and enable the Sheets API in Google
   Cloud Console.
