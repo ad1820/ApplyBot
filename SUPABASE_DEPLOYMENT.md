@@ -1,17 +1,18 @@
 # Publishing to Supabase — Full Active Deployment Guide
 
-This guide gets the whole system **actively running**: Supabase as the
-database + scheduler, your FastAPI app reachable over HTTPS, and the
-Telegram bot always listening.
+This guide gets the whole system **actively running** using **only free
+tiers**: Supabase as the database + scheduler, and a single free Render Web
+Service (or any other host with a free always-on web tier) handling both
+the Telegram bot and the job-search trigger. No paid Background Worker or
+Cron Job is required anywhere.
 
 ## Important: what Supabase does and doesn't run
 
 Supabase hosts your **Postgres database** and can **trigger scheduled HTTP
 calls** (via `pg_cron` + `pg_net`), and optionally **Edge Functions**
-(Deno/TypeScript). It does **not** run your Python FastAPI app or a
-long-lived Telegram polling process — those need a small always-on compute
-host (Railway, Render, Fly.io, a VPS, etc.), which Supabase Cron calls into
-on a schedule.
+(Deno/TypeScript). It does **not** run your Python FastAPI app - that needs
+a small host with an HTTPS endpoint (Render, Railway, Fly.io, a VPS, etc.),
+which Supabase Cron calls into on a schedule.
 
 So "publishing to Supabase" in this project means:
 
@@ -20,13 +21,19 @@ Supabase (Postgres + pg_cron + pg_net)
         |
         | scheduled HTTPS POST
         v
-Your deployed FastAPI app  (/run/job-search)
+Your deployed FastAPI Web Service  (/run/job-search)
+        ^
         |
-        v
-Telegram (via a separate always-on poller process)
+        | Telegram webhook (no separate worker needed)
+        |
+Telegram
 ```
 
-Both pieces are covered below so everything ends up actively running.
+**This is the recommended setup if your hosting plan's Background
+Worker/Cron Job tiers aren't free** (e.g. Render's free tier only covers
+Web Services): everything - the bot's command handling *and* the scheduled
+discovery trigger - runs through the one free Web Service. Both pieces are
+covered below.
 
 ---
 
@@ -70,9 +77,11 @@ This writes directly to your Supabase project via the service_role key.
 
 ## Step 4 — Deploy the FastAPI app somewhere reachable over HTTPS
 
-Supabase Cron calls your app over the public internet, so it needs a real
-HTTPS URL. Any small host works (Railway, Render, Fly.io, a VPS + reverse
-proxy). Using the provided `Dockerfile`:
+Supabase Cron and Telegram's webhook both call your app over the public
+internet, so it needs a real HTTPS URL. This is exactly what a single free
+Render Web Service (or Railway/Fly.io free tier) provides - see
+`RENDER_DEPLOYMENT.md` for the Render-specific click-through steps, or use
+the provided `Dockerfile` on any host:
 
 ```bash
 docker build -t job-application-agent .
@@ -101,24 +110,50 @@ curl https://<your-deployed-host>/health
 
 Expect `{"status":"ok","supabase":"connected","telegram":"configured"}`.
 
-## Step 5 — Run the Telegram bot poller (always-on, second process)
+## Step 5 — Point Telegram's webhook at your Web Service (no worker needed)
 
-The FastAPI container only serves HTTP endpoints — it does not listen for
-Telegram messages by itself. Run this as a second always-on process
-alongside it (a second container, a systemd service, or a background
-worker on your host):
+If your host's Background Worker/Cron Job tiers aren't free (this is the
+case on Render), don't run `scripts/telegram_polling.py` as a second
+process at all. Instead, use the `POST /telegram/webhook` endpoint already
+built into the FastAPI app - it shares the exact same
+`app.telegram.handlers.dispatch_command` logic as the polling script, so
+every command (`/jobs`, `/done`, `/setresume`, etc.) works identically.
+
+Tell Telegram to deliver updates to your deployed endpoint:
 
 ```bash
+curl "https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-deployed-host>/telegram/webhook"
+```
+
+Verify it worked:
+
+```bash
+curl "https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/getWebhookInfo"
+```
+
+You should see your URL listed with no `last_error_message`. Then send
+`/help` to your bot in Telegram - you should get an immediate reply,
+handled entirely by your existing Web Service with **zero additional
+processes or paid tiers**.
+
+If you ever want to switch back to polling (e.g. while developing
+locally), first remove the webhook so Telegram doesn't also try to deliver
+to it, then run the polling script:
+
+```bash
+curl "https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/deleteWebhook"
 python scripts/telegram_polling.py
 ```
 
-Verify it's alive by sending `/help` to your bot — you should get an
-immediate reply. If this process ever stops, Telegram queues your messages;
-restarting the poller will process the backlog with no duplicates (the
-`notifications` table prevents duplicate sends).
-
-Only run **one** poller instance at a time — Telegram rejects concurrent
-`getUpdates` long-polling clients on the same bot token.
+If you do run the polling script anywhere (e.g. locally, or on a host
+where a worker process is free), only run **one** instance at a time -
+Telegram rejects concurrent `getUpdates` long-polling clients on the same
+bot token - and don't set a webhook at the same time, since Telegram only
+delivers updates through one transport at a time. If the webhook or the
+poller ever stops receiving for a while, Telegram queues messages up to a
+point; resuming either transport processes the backlog with no duplicates
+(the `notifications` table prevents duplicate sends for job alerts, and
+command replies are simply re-dispatched).
 
 ## Step 6 — Schedule discovery runs with Supabase Cron
 
@@ -236,9 +271,14 @@ sync → notify) runs unattended on your chosen cadence.
   app's `.env`.
 - **`PGRST125` / "Invalid path"** → `SUPABASE_URL` has a trailing slash or
   `/rest/v1` suffix; fix in `.env` (also auto-normalized by `app/config.py`).
-- **Bot not responding** → confirm `scripts/telegram_polling.py` is still
-  running as a live process; check `getUpdates` for a growing backlog as a
-  sign nothing is consuming it.
+- **Bot not responding (webhook mode)** → check
+  `getWebhookInfo` for a `last_error_message`; confirm your Web Service is
+  actually reachable and its `/telegram/webhook` endpoint returns 200; check
+  your host's logs for errors during `dispatch_command`.
+- **Bot not responding (polling mode)** → confirm `scripts/telegram_polling.py`
+  is still running as a live process, and that no webhook is also set
+  (`getWebhookInfo` should show an empty `url`) - Telegram only delivers to
+  one transport at a time.
 - **Nothing ever gets notified** → check `MINIMUM_MATCH_SCORE`, your
   `preferred_roles`/skills in Supabase, and that `config/candidate_skills.json`
   has been synced via `scripts/sync_skills.py`.

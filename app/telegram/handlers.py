@@ -229,3 +229,69 @@ def handle_approve_resume(ctx: BotContext, job_id: str) -> str:
     latest = sorted(drafts, key=lambda d: d.get("created_at") or "", reverse=True)[0]
     approved = ctx.tailored_resumes.approve(latest["id"])
     return format_resume_approved(job_id, approved)
+
+
+_STATUS_TRANSITION_COMMANDS = ("interview", "rejected", "offer", "withdraw")
+
+
+def dispatch_command(ctx: BotContext, text: str) -> str:
+    """Parse a raw Telegram message's text and dispatch it to the right
+    handler. Shared by both the long-polling script
+    (scripts/telegram_polling.py) and the FastAPI webhook endpoint
+    (app.main:telegram_webhook) so command behavior is identical regardless
+    of which transport delivered the update."""
+    parts = text.strip().split(maxsplit=1)
+    if not parts:
+        return "Unknown command. Use /help to see available commands."
+    command = parts[0].lower().lstrip("/")
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if command == "start":
+        return handle_start()
+    if command == "help":
+        return handle_help()
+    if command == "today":
+        return handle_today(ctx)
+    if command == "jobs":
+        return handle_jobs(ctx)
+    if command == "job":
+        return handle_job(ctx, arg)
+    if command == "done":
+        return handle_done(ctx, arg)
+    if command == "skip":
+        return handle_skip(ctx, arg)
+    if command == "status":
+        return handle_status(ctx, arg)
+    if command == "applied":
+        return handle_applied(ctx)
+    if command == "stats":
+        return handle_stats(ctx)
+    if command in _STATUS_TRANSITION_COMMANDS:
+        return handle_status_transition(ctx, command, arg)
+    if command == "setresume":
+        return handle_set_resume(ctx, arg)
+    if command == "resume":
+        return handle_resume_analysis(ctx, arg)
+    if command == "approveresume":
+        return handle_approve_resume(ctx, arg)
+    return "Unknown command. Use /help to see available commands."
+
+
+def build_bot_context_from_settings() -> BotContext:
+    """Construct a BotContext wired to real Supabase repositories and the
+    configured LLM provider. Used by both the polling script and the
+    webhook endpoint so wiring only lives in one place."""
+    from app.db.repositories.analytics import AnalyticsEventRepository
+    from app.db.supabase import get_supabase_client
+    from app.llm.provider import get_llm_provider
+
+    client = get_supabase_client()
+    return BotContext(
+        jobs=JobRepository(client),
+        applications=ApplicationRepository(client),
+        analytics=AnalyticsEventRepository(client),
+        profiles=CandidateProfileRepository(client),
+        master_resumes=MasterResumeRepository(client),
+        tailored_resumes=TailoredResumeRepository(client),
+        llm_provider=get_llm_provider(),
+    )

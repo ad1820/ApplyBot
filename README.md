@@ -198,13 +198,17 @@ This section covers deploying the agent so it runs unattended: a scheduled
 discovery job, an always-listening Telegram bot, and persistent state that
 survives restarts/redeploys. See `HOW_TO_RUN.md` for local development.
 
-Two platform-specific, copy-paste-ready deployment guides are also
+Three platform-specific, copy-paste-ready deployment guides are also
 available:
 - **`SUPABASE_DEPLOYMENT.md`** — schedule discovery via Supabase Cron
   (`pg_cron`/`pg_net`) calling your app's HTTP endpoint.
 - **`NORTHFLANK_DEPLOYMENT.md`** — host the FastAPI app, Telegram poller,
   and scheduled discovery entirely on Northflank (Services + a native Cron
   Job running `scripts/run_discovery.py` directly, no HTTP hop needed).
+- **`RENDER_DEPLOYMENT.md`** — host the FastAPI app (Web Service), Telegram
+  poller (Background Worker), and scheduled discovery (Cron Job) entirely
+  on Render, with notes on Render's free-tier scope and UTC-only cron
+  scheduling.
 
 ## 11. Prerequisites for Production
 
