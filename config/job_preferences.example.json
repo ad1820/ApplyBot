@@ -1,0 +1,11 @@
+{
+  "_comment": "Your job-search preferences - edit directly, then run `python scripts/setup_profile.py` to push into Supabase. work_mode must be one of: remote | hybrid | onsite | any.",
+  "preferred_roles": ["Software Engineer"],
+  "preferred_technologies": ["Python"],
+  "preferred_locations": ["USA", "Remote"],
+  "work_mode": "any",
+  "minimum_salary": 0,
+  "preferred_company_types": [],
+  "excluded_companies": [],
+  "fresher_friendly_only": true
+}

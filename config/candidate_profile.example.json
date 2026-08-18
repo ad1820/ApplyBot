@@ -1,0 +1,12 @@
+{
+  "_comment": "Template for config/candidate_profile.json. Copy this file to candidate_profile.json (git-ignored, since it contains your real PII) and fill in your real details, then run `python scripts/setup_profile.py`.",
+  "name": "Your Name",
+  "email": "you@example.com",
+  "phone": "9999999999",
+  "location": "Bangalore, India",
+  "years_of_experience": 0,
+  "education": [],
+  "experience": [],
+  "preferred_companies": [],
+  "excluded_companies": []
+}

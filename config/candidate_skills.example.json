@@ -1,0 +1,4 @@
+{
+  "_comment": "This is the single source of truth for your canonical skill list. Edit this file directly, then run `python scripts/sync_skills.py` to push it into your Supabase candidate_profiles.skills field. The matcher compares job requirements against exactly this list (plus the semantic skill taxonomy in app/jobs/skills_taxonomy.py, and an optional LLM check for anything not covered there).",
+  "skills":[]
+}
