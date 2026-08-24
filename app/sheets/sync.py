@@ -7,6 +7,7 @@ retried on a later run rather than crashing the whole process.
 """
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,21 +54,19 @@ class SheetsClient:
 
     Accepts credentials either as a file path on disk (local development)
     or as the raw JSON content of the service account key (production
-    secrets, e.g. an env var pasted into a hosting platform) - whichever is
-    available is used, so the same code works unchanged in both
-    environments.
+    secrets).
     """
 
     def __init__(self, service_account_file: str = "", service_account_json: str = "", spreadsheet_id: str = ""):
         self.service_account_file = service_account_file
         self.service_account_json = service_account_json
         self.spreadsheet_id = spreadsheet_id
-        self._worksheet = None
+        self._spreadsheet = None
+        self._master_worksheet = None
 
     def _connect(self):
         import gspread
         from google.oauth2.service_account import Credentials
-
         from app.json_config import ConfigLoadError, load_json_config
 
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -81,36 +80,58 @@ class SheetsClient:
             raise RuntimeError(str(exc)) from exc
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(self.spreadsheet_id)
+        
+        self._spreadsheet = client.open_by_key(self.spreadsheet_id)
+        self._master_worksheet = self._get_or_create_worksheet("Jobs")
+        return self._master_worksheet
+        
+    def _apply_formatting(self, worksheet: Any) -> None:
+        """Applies good-looking formatting to a newly created worksheet."""
         try:
-            worksheet = spreadsheet.worksheet("Jobs")
-        except gspread.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet("Jobs", rows=1000, cols=len(SHEET_COLUMNS))
-            worksheet.append_row(SHEET_COLUMNS)
-        self._worksheet = worksheet
-        return worksheet
+            worksheet.freeze(rows=1)
+            # Bold header with dark background, light text
+            worksheet.format(
+                "A1:L1",
+                {
+                    "textFormat": {"bold": True, "fontSize": 11, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                    "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
+                    "horizontalAlignment": "CENTER",
+                }
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to apply formatting to worksheet {worksheet.title}: {exc}")
 
-    def append_row(self, row: list[Any]) -> None:
-        worksheet = self._worksheet or self._connect()
-        # table_range anchors the "find the next empty row" scan to start
-        # from column A of the header row, instead of letting the Sheets
-        # API infer the table's shape from whatever content happens to be
-        # in the sheet. Without this, a single stray/irregular row (e.g. a
-        # manually-pasted row with fewer columns than SHEET_COLUMNS) can
-        # cause every subsequent append to drift further right, corrupting
-        # the whole sheet.
-        worksheet.append_row(row, table_range="A1")
+    def _get_or_create_worksheet(self, title: str) -> Any:
+        import gspread
+        if not self._spreadsheet:
+            self._connect()
+        try:
+            return self._spreadsheet.worksheet(title)
+        except gspread.WorksheetNotFound:
+            worksheet = self._spreadsheet.add_worksheet(title, rows=1000, cols=len(SHEET_COLUMNS))
+            worksheet.append_row(SHEET_COLUMNS)
+            self._apply_formatting(worksheet)
+            return worksheet
+
+    def append_row(self, row: list[Any], date_str: str) -> None:
+        if not self._master_worksheet:
+            self._connect()
+            
+        # Append to master sheet
+        self._master_worksheet.append_row(row, table_range="A1")
+        
+        # Append to date-specific sheet
+        if date_str:
+            try:
+                date_ws = self._get_or_create_worksheet(date_str)
+                date_ws.append_row(row, table_range="A1")
+            except Exception as exc:
+                logger.warning(f"Failed to append row to date worksheet {date_str}: {exc}")
 
 
 def build_sheets_client_from_settings() -> Optional[SheetsClient]:
     """Build a SheetsClient from app settings, or return None if Sheets
-    sync isn't configured (neither a file path nor JSON content is set).
-    Never raises - Sheets is optional.
-
-    Supports credentials via GOOGLE_SERVICE_ACCOUNT_FILE (a path on disk,
-    for local development) or GOOGLE_SERVICE_ACCOUNT_JSON (the key's raw
-    JSON content, for production secrets) - whichever is present is used.
-    """
+    sync isn't configured."""
     from app.config import get_settings
 
     settings = get_settings()
@@ -133,7 +154,11 @@ def sync_job_row(client: Optional[SheetsClient], job: dict[str, Any], applicatio
         return False
     try:
         row = job_to_row(job, application, referral)
-        client.append_row(row)
+        date_str = str(job.get("discovered_at") or "")[:10]
+        if not date_str:
+            date_str = datetime.date.today().isoformat()
+            
+        client.append_row(row, date_str=date_str)
         log_event(logger, "info", "Sheets sync succeeded", job_id=str(job.get("id")), operation="sheets_sync", status="SUCCESS")
         return True
     except Exception as exc:  # noqa: BLE001 - must never crash the pipeline

@@ -80,20 +80,40 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
     # indefinitely and/or mark the webhook as failing.
     try:
         from app.telegram.bot import TelegramBot
-        from app.telegram.handlers import build_bot_context_from_settings, dispatch_command
+        from app.telegram.handlers import (
+            build_bot_context_from_settings,
+            dispatch_callback_query,
+            dispatch_command_with_markup,
+        )
+        from app.telegram.messages import chunk_message
 
         payload = await request.json()
         message = payload.get("message")
-        if not message or "text" not in message:
-            # Non-text updates (edited messages, callback queries, etc.)
-            # are acknowledged but not acted on for now.
-            return {"ok": True}
-
-        chat_id = str(message["chat"]["id"])
-        ctx = build_bot_context_from_settings()
-        reply = dispatch_command(ctx, message["text"])
+        callback_query = payload.get("callback_query")
         bot = TelegramBot(settings.telegram_bot_token)
-        bot.send_message(chat_id, reply)
+
+        if message and "text" in message:
+            chat_id = str(message["chat"]["id"])
+            ctx = build_bot_context_from_settings()
+            reply, markup = dispatch_command_with_markup(ctx, message["text"])
+            # Telegram rejects messages over ~4096 chars with a 400 Bad
+            # Request (e.g. /today or /jobs with many results) - split into
+            # multiple messages rather than letting that raise inside this
+            # try block. The inline keyboard (if any) only makes sense on
+            # the final chunk.
+            chunks = chunk_message(reply)
+            for i, chunk in enumerate(chunks):
+                is_last = i == len(chunks) - 1
+                bot.send_message(chat_id, chunk, reply_markup=markup if is_last else None)
+        elif callback_query and callback_query.get("message"):
+            chat_id = str(callback_query["message"]["chat"]["id"])
+            ctx = build_bot_context_from_settings()
+            reply = dispatch_callback_query(ctx, callback_query.get("data", ""))
+            bot.answer_callback_query(callback_query["id"])
+            for chunk in chunk_message(reply):
+                bot.send_message(chat_id, chunk)
+        # Any other update shape (edited messages, malformed callback
+        # queries, etc.) is acknowledged but not acted on.
     except Exception as exc:  # noqa: BLE001 - see comment above
         logger.error("Failed to handle telegram webhook update: %s", exc, exc_info=True)
 

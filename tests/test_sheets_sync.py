@@ -54,9 +54,9 @@ def test_append_row_always_anchors_to_column_a():
     from app.sheets.sync import SheetsClient
 
     client = SheetsClient(service_account_file="unused", spreadsheet_id="sheet-1")
-    client._worksheet = FakeWorksheet()
+    client._master_worksheet = FakeWorksheet()
 
-    client.append_row(["2026-08-18", "Acme", "Backend Engineer"])
+    client.append_row(["2026-08-18", "Acme", "Backend Engineer"], date_str="2026-08-18")
 
     assert captured["table_range"] == "A1"
     assert captured["row"] == ["2026-08-18", "Acme", "Backend Engineer"]

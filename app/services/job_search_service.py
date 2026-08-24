@@ -20,11 +20,12 @@ from app.db.repositories.notifications import NotificationRepository
 from app.db.repositories.runs import AgentRunRepository
 from app.jobs.deduplicator import compute_canonical_key
 from app.jobs.discovery import JobSource
+from app.jobs.fresher_roles import load_fresher_hiring_roles
 from app.jobs.matcher import score_job, title_matches_preferred_roles
 from app.jobs.models import Job, JobStatus
 from app.logging_config import get_logger, log_event
-from app.telegram.bot import TelegramBot, apply_url_button
-from app.telegram.messages import format_job_notification
+from app.telegram.bot import TelegramBot
+from app.telegram.messages import format_company_digest
 
 logger = get_logger(__name__)
 
@@ -59,6 +60,9 @@ class JobSearchService:
         run_id = run["id"]
         counters = {"jobs_found": 0, "jobs_new": 0, "jobs_duplicate": 0, "jobs_notified": 0}
         last_error: Optional[str] = None
+        notified_jobs: list[dict[str, Any]] = []
+
+        preferences = self._augment_preferred_roles(preferences)
 
         for source in self.sources:
             try:
@@ -70,13 +74,15 @@ class JobSearchService:
 
             for job in raw_jobs:
                 try:
-                    self._process_job(job, profile, preferences, counters, run_id)
+                    self._process_job(job, profile, preferences, counters, run_id, notified_jobs)
                 except Exception as exc:  # noqa: BLE001 - one bad job must not abort the run
                     title = getattr(job, "title", "<unknown>")
                     company = getattr(job, "company", "<unknown>")
                     last_error = f"Failed processing job {title} @ {company}: {exc}"
                     log_event(logger, "error", last_error, run_id=run_id, operation="process_job", status="FAILED")
                     continue
+
+        self._notify_digest(notified_jobs, counters, run_id)
 
         self.run_repo.update_counters(run_id, **counters)
         if last_error:
@@ -86,6 +92,23 @@ class JobSearchService:
 
         return {"run_id": run_id, **counters, "error": last_error}
 
+    def _augment_preferred_roles(self, preferences: dict[str, Any]) -> dict[str, Any]:
+        """Broaden preferences["preferred_roles"] with the curated fresher
+        role phrases from fresher_hiring_roles.txt (see app.jobs.fresher_roles),
+        additively - never replacing whatever the user already configured -
+        so common India fresher-hiring title patterns (SDE, SDET, GET,
+        MTS-1, etc.) are recognized as matches even if not explicitly listed
+        in config/job_preferences.json. A copy is returned; the caller's
+        original preferences dict is left untouched.
+        """
+        fresher_roles = load_fresher_hiring_roles()
+        if not fresher_roles:
+            return preferences
+        existing = list(preferences.get("preferred_roles") or [])
+        existing_lower = {r.lower() for r in existing}
+        merged = existing + [r for r in fresher_roles if r.lower() not in existing_lower]
+        return {**preferences, "preferred_roles": merged}
+
     def _process_job(
         self,
         job: Job,
@@ -93,8 +116,18 @@ class JobSearchService:
         preferences: dict[str, Any],
         counters: dict[str, int],
         run_id: str,
+        notified_jobs: list[dict[str, Any]],
     ) -> None:
         counters["jobs_found"] += 1
+        
+        # Hard blocklist: never read/process/save jobs with these words in the title.
+        import re
+        blocklist = ["senior", "sales", "marketing", "staff", "principle", "principal"]
+        title_lower = job.title.lower()
+        if any(re.search(rf"\b{word}\b", title_lower) for word in blocklist):
+            log_event(logger, "info", "Job title contains blocklisted word - skipping entirely", run_id=run_id, title=job.title)
+            return
+
         canonical_key = compute_canonical_key(job.company, job.title, job.location, job.external_id)
         existing = self.job_repo.find_by_canonical_key(canonical_key)
 
@@ -157,30 +190,46 @@ class JobSearchService:
             return
 
         # From here on the job has cleared both the role and score filters -
-        # sync it to Sheets (best-effort) and notify via Telegram.
+        # sync it to Sheets (best-effort) and queue it for the end-of-run
+        # grouped Telegram digest (see _notify_digest) rather than pushing
+        # an individual message immediately - a run finding many matches at
+        # once should produce one message to scan, not one push per job.
         if self.sheets_sync_fn:
             try:
                 self.sheets_sync_fn(created)
             except Exception as exc:  # noqa: BLE001 - Sheets must never block the pipeline
                 log_event(logger, "error", "sheets sync failed", run_id=run_id, job_id=created["id"], error=str(exc))
 
-        self._notify(created, counters, run_id)
+        self._queue_notification(created, notified_jobs)
 
-    def _notify(self, job: dict[str, Any], counters: dict[str, int], run_id: str) -> None:
+    def _queue_notification(self, job: dict[str, Any], notified_jobs: list[dict[str, Any]]) -> None:
         if not self.telegram_bot or not self.telegram_chat_id:
             return
         if self.notification_repo.already_sent(job["id"]):
             return
         self.notification_repo.record_pending(job["id"])
+        notified_jobs.append(job)
+
+    def _notify_digest(self, notified_jobs: list[dict[str, Any]], counters: dict[str, int], run_id: str) -> None:
+        """Send exactly one grouped-by-company message for every job queued
+        during this run (see _queue_notification), instead of one push per
+        job. Tapping a company's inline button later shows that company's
+        jobs (see app.telegram.handlers.handle_company_jobs_callback and
+        the /companies command) - both read live from Supabase, so this
+        digest itself only needs to announce which companies matched.
+        """
+        if not notified_jobs or not self.telegram_bot or not self.telegram_chat_id:
+            return
+        text, markup = format_company_digest(notified_jobs)
         try:
-            text = format_job_notification(job)
-            markup = apply_url_button(job["url"]) if job.get("url") else None
             response = self.telegram_bot.send_message(self.telegram_chat_id, text, reply_markup=markup)
             message_id = str(response.get("result", {}).get("message_id", ""))
-            self.notification_repo.mark_sent(job["id"], message_id)
-            self.job_repo.set_status(job["id"], JobStatus.NOTIFIED.value)
-            counters["jobs_notified"] += 1
+            for job in notified_jobs:
+                self.notification_repo.mark_sent(job["id"], message_id)
+                self.job_repo.set_status(job["id"], JobStatus.NOTIFIED.value)
+                counters["jobs_notified"] += 1
         except Exception as exc:  # noqa: BLE001 - notification failure must not abort the run
-            self.notification_repo.mark_failed(job["id"], str(exc))
-            log_event(logger, "error", "telegram notification failed", run_id=run_id, job_id=job["id"], error=str(exc))
+            for job in notified_jobs:
+                self.notification_repo.mark_failed(job["id"], str(exc))
+            log_event(logger, "error", "telegram digest notification failed", run_id=run_id, error=str(exc))
 

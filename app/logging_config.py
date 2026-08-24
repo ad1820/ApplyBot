@@ -58,9 +58,21 @@ def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers.clear()
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(StructuredFormatter())
-    root.addHandler(handler)
+    
+    formatter = StructuredFormatter()
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    root.addHandler(console_handler)
+    
+    # File handler
+    from pathlib import Path
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    file_handler = logging.FileHandler(log_dir / "app.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -48,10 +48,33 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
-    # LLM
+    # LLM — legacy single-provider fields (kept for backward compatibility with
+    # existing .env files; the new chain-based factory does not use these).
     llm_provider: str = "null"
     llm_api_key: str = ""
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = ""
+
+    # Google Gemini — used in both chains (job matching: primary position;
+    # reasoning: secondary fallback after NVIDIA NIM).
+    # Both models are optional within the provider -- if fallback equals
+    # primary, only one Gemini instance is placed in the chain.
+    gemini_api_key: str = ""
+    gemini_primary_model: str = "gemini-3.5-flash-lite"
+    gemini_fallback_model: str = "gemini-3.1-flash-lite"
+
+    # NVIDIA NIM — primary reasoning / tool-calling provider.
+    # Default model: meta/muse-glimmer-30b (strong 30B model via NIM API).
+    nvidia_nim_api_key: str = ""
+    nvidia_nim_model: str = "meta/muse-glimmer-30b"
+
+    # Groq Cloud (https://console.groq.com) — OpenAI-compatible API with a
+    # generous free tier. Configured via GROQ_MODELS (comma-separated list);
+    # leave blank to exclude Groq from the chains entirely. Multiple models
+    # bypass the 1k req/day limit by falling back across them.
+    # Recommended large (>15B) models: openai/gpt-oss-120b, openai/gpt-oss-20b,
+    # qwen/qwen3.6-27b
+    groq_api_key: str = ""
+    groq_models: str = ""
 
     # Google Sheets credentials. In local development, point
     # GOOGLE_SERVICE_ACCOUNT_FILE at a JSON key file on disk. In production
@@ -82,7 +105,7 @@ class Settings(BaseSettings):
     # Only jobs scoring at or above this match percentage are pushed as
     # Telegram notifications (still persisted below the threshold so they
     # remain visible via /jobs, just not pushed proactively).
-    minimum_match_score: float = 80.0
+    minimum_match_score: float = 82.0
 
     def supabase_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_key)

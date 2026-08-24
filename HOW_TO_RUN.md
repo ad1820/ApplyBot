@@ -10,8 +10,8 @@ keep it running day-to-day. For architecture/design details see `README.md`.
 - Python 3.11+ (project developed/tested on 3.13)
 - A Supabase project (free tier is fine)
 - A Telegram bot token (via [@BotFather](https://t.me/BotFather))
-- (Optional) An OpenAI or Anthropic API key, for semantic skill matching /
-  resume analysis / cover letters
+- (Optional) Gemini, NVIDIA NIM, or Groq API keys for semantic skill matching /
+  cover letter generation. (Defaults to `null` provider — fully offline mode).
 - (Optional) A Google Cloud service account, for Google Sheets sync
 
 ---
@@ -41,12 +41,11 @@ Open `.env` and fill in:
 | `SUPABASE_KEY` | Same page → **service_role** key (not the anon key). |
 | `TELEGRAM_BOT_TOKEN` | From @BotFather after `/newbot`. |
 | `TELEGRAM_CHAT_ID` | Message your bot once, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `message.chat.id`. |
-| `LLM_PROVIDER` | `openai`, `anthropic`, or `null` (default — no LLM calls, deterministic-only matching still works). |
-| `LLM_API_KEY`, `LLM_MODEL` | Only needed if `LLM_PROVIDER` isn't `null`. |
+| `GEMINI_API_KEY`, etc. | LLM configuration is optional. See `.env.example` for details on the Gemini, NVIDIA NIM, and Groq fallback chains. |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | Local dev: absolute path to a downloaded service-account JSON key file. |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Production fallback: paste the same key file's raw JSON content here instead (used only if the file above isn't found - see §6c). |
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | The ID from your spreadsheet's URL (the long string between `/d/` and `/edit`). |
-| `MINIMUM_MATCH_SCORE` | Minimum score (0-100) required before a job is pushed as a Telegram alert. Default `80`. |
+| `MINIMUM_MATCH_SCORE` | Minimum score (0-100) required before a job is pushed as a Telegram alert. Default `82`. |
 | `SCHEDULER_SECRET` | Any random string — required as a header to trigger scheduled runs manually/via cron. |
 | `APP_TIMEZONE` | e.g. `Asia/Kolkata`. |
 | `CANDIDATE_PROFILE_JSON`, `JOB_PREFERENCES_JSON`, `CANDIDATE_SKILLS_JSON` | Production fallback for §6's config files - see §6c. |
@@ -258,6 +257,7 @@ Expect all tests to pass (150+ at time of writing).
 | `/skip <id>` | Skip a job you're not interested in |
 | `/status <id>`, `/applied`, `/stats` | Track your pipeline |
 | `/interview <id>`, `/rejected <id>`, `/offer <id>`, `/withdraw <id>` | Update application stage |
+| `/companies` | Browse notified jobs grouped by company - tap a company button to see just its matching roles |
 | `/setresume <text>` | Save a new master resume version |
 | `/resume <id>` | Analyze resume fit against a job |
 | `/approveresume <id>` | Approve the tailored resume draft |
@@ -280,8 +280,5 @@ Expect all tests to pass (150+ at time of writing).
   find/stop the process holding it (`netstat -ano | findstr :8000` on
   Windows, then `taskkill /PID <pid> /F`).
 - **All jobs scoring low / nothing notified** → check `MINIMUM_MATCH_SCORE`
-  (default 80 is strict by design), your `preferred_roles`/`skills` in
+  (default 82 is strict by design), your `preferred_roles`/`skills` in
   Supabase, and that `config/candidate_skills.json` has been synced.
-- **Anthropic `KeyError: 'text'` (fixed, but for reference)** → some Claude
-  models return a "thinking" block before the text block; the provider
-  already scans for the first real text block rather than assuming index 0.

@@ -1,21 +1,23 @@
-"""One-shot job-discovery entrypoint, meant to be run directly by a
-scheduler (e.g. a Northflank Cron Job) rather than triggered over HTTP.
+"""One-shot job-discovery entrypoint. Run this yourself whenever you want a
+fresh batch of jobs - 2-3 times a day, on your own schedule, no hosting or
+cron dependency required. See DAILY_RUN.md for the everyday workflow.
 
 This wraps the exact same logic as the FastAPI POST /run/job-search
 endpoint (app.main:trigger_job_search) - both call
 app.agents.job_agent.run_job_search(default_sources(...)) - so behavior is
-identical whether you trigger a run via HTTP or via a scheduled process
-executing this script.
+identical whether you run this script directly or (if you ever do deploy
+somewhere) trigger it via HTTP or a scheduler.
 
-Usage (as a Northflank Job command, or any cron):
+Usage:
     python scripts/run_discovery.py
 
 Optional: pass Greenhouse board tokens as arguments to also pull specific
 companies' postings, e.g.:
     python scripts/run_discovery.py stripe discord
 
-Exits with status 0 on COMPLETED, 1 on FAILED/PARTIAL or any error, so the
-scheduler can alert on failures (e.g. Northflank Job retry/alerting).
+Exits with status 0 on COMPLETED, 1 on FAILED/PARTIAL or any error.
+Re-running right after a previous run is always safe - duplicate jobs are
+detected and skipped, never re-notified.
 """
 from __future__ import annotations
 

@@ -1,7 +1,11 @@
 from app.telegram.messages import (
     HELP_TEXT,
+    company_callback_hash,
     escape_html,
     format_application_confirmation,
+    format_company_digest,
+    format_company_jobs,
+    format_company_list,
     format_job_notification,
     format_stats,
 )
@@ -85,3 +89,61 @@ def test_format_stats():
     text = format_stats(stats)
     assert "42" in text
     assert "19.0%" in text
+
+
+def test_company_callback_hash_deterministic_and_case_insensitive():
+    assert company_callback_hash("OpenAI") == company_callback_hash("openai")
+    assert company_callback_hash("OpenAI") == company_callback_hash(" OpenAI ")
+    assert company_callback_hash("OpenAI") != company_callback_hash("Acme")
+    # Must fit comfortably within Telegram's 64-byte callback_data limit.
+    assert len(f"co:{company_callback_hash('A Very Long Company Name Inc.')}") <= 64
+
+
+def test_format_company_digest_groups_and_counts_by_company():
+    jobs = [
+        {"company": "Acme", "title": "Backend Engineer"},
+        {"company": "Acme", "title": "Platform Engineer"},
+        {"company": "OpenAI", "title": "Research Engineer"},
+    ]
+    text, markup = format_company_digest(jobs)
+    assert "3 new matching jobs" in text
+    assert "2 companies" in text
+
+    buttons = [btn for row in markup["inline_keyboard"] for btn in row]
+    labels = {btn["text"] for btn in buttons}
+    assert labels == {"Acme (2)", "OpenAI (1)"}
+    for btn in buttons:
+        assert btn["callback_data"].startswith("co:")
+
+
+def test_format_company_digest_singular_wording_for_one_job_one_company():
+    jobs = [{"company": "Acme", "title": "Backend Engineer"}]
+    text, _ = format_company_digest(jobs)
+    assert "1 new matching job" in text
+    assert "new matching jobs" not in text
+    assert "1 company" in text
+    assert "1 companies" not in text
+
+
+def test_format_company_jobs_renders_all_jobs_for_company():
+    jobs = [
+        {"id": "1", "title": "Backend Engineer", "company": "Acme", "match_score": 90, "url": "https://x.com/1"},
+        {"id": "2", "title": "Platform Engineer", "company": "Acme", "match_score": 85, "url": "https://x.com/2"},
+    ]
+    text = format_company_jobs("Acme", jobs)
+    assert "Acme" in text
+    assert "2 matching roles" in text
+    assert "Backend Engineer" in text
+    assert "Platform Engineer" in text
+
+
+def test_format_company_jobs_empty_list():
+    text = format_company_jobs("Acme", [])
+    assert "No matching jobs" in text
+    assert "Acme" in text
+
+
+def test_format_company_list_empty_returns_friendly_message_no_buttons():
+    text, markup = format_company_list([])
+    assert "No notified jobs yet" in text
+    assert markup == {}

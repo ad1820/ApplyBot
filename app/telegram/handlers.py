@@ -21,8 +21,11 @@ from app.jobs.models import Job, JobStatus, can_transition
 from app.llm.base import LLMProvider
 from app.telegram.messages import (
     HELP_TEXT,
+    company_callback_hash,
     escape_html,
     format_application_confirmation,
+    format_company_jobs,
+    format_company_list,
     format_job_detail,
     format_resume_analysis,
     format_resume_approved,
@@ -74,6 +77,38 @@ def handle_job(ctx: BotContext, job_id: str) -> str:
     if not job:
         return f"Job {escape_html(job_id)} not found."
     return format_job_detail(job)
+
+
+def _notified_jobs_by_company(ctx: BotContext) -> dict[str, list[dict[str, Any]]]:
+    jobs = ctx.jobs.list_by_status(JobStatus.NOTIFIED.value)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        company = job.get("company") or "Unknown Company"
+        grouped.setdefault(company, []).append(job)
+    return grouped
+
+
+def handle_companies(ctx: BotContext) -> tuple[str, dict[str, Any]]:
+    """Standing command to (re-)browse notified jobs grouped by company at
+    any time, not just right after a fresh discovery run - see also the
+    end-of-run digest built in app.services.job_search_service."""
+    grouped = _notified_jobs_by_company(ctx)
+    all_jobs = [job for jobs in grouped.values() for job in jobs]
+    return format_company_list(all_jobs)
+
+
+def handle_company_jobs_callback(ctx: BotContext, callback_data: str) -> str:
+    """Resolve a "co:<hash>" callback_data (tapped from either the
+    end-of-run digest or /companies) back to a company name and return all
+    of that company's currently notified jobs."""
+    if not callback_data.startswith("co:"):
+        return "Unrecognized selection."
+    target_hash = callback_data[len("co:"):]
+    grouped = _notified_jobs_by_company(ctx)
+    for company, jobs in grouped.items():
+        if company_callback_hash(company) == target_hash:
+            return format_company_jobs(company, jobs)
+    return "That company's jobs are no longer available (they may have been updated or skipped)."
 
 
 def handle_done(ctx: BotContext, job_id: str, resume_version: Optional[str] = None) -> str:
@@ -254,6 +289,12 @@ def dispatch_command(ctx: BotContext, text: str) -> str:
         return handle_today(ctx)
     if command == "jobs":
         return handle_jobs(ctx)
+    if command == "companies":
+        # Plain dispatch_command only returns text (no inline keyboard) -
+        # callers that want the tappable company buttons should use
+        # dispatch_command_with_markup instead (see below), which both
+        # scripts/telegram_polling.py and app.main's webhook use.
+        return handle_companies(ctx)[0]
     if command == "job":
         return handle_job(ctx, arg)
     if command == "done":
@@ -275,6 +316,30 @@ def dispatch_command(ctx: BotContext, text: str) -> str:
     if command == "approveresume":
         return handle_approve_resume(ctx, arg)
     return "Unknown command. Use /help to see available commands."
+
+
+def dispatch_command_with_markup(ctx: BotContext, text: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """Like dispatch_command, but also returns an optional inline-keyboard
+    reply_markup for commands that need tappable buttons (currently just
+    /companies). Both scripts/telegram_polling.py and app.main's webhook
+    call this (instead of plain dispatch_command) so the company buttons
+    work identically regardless of transport.
+    """
+    parts = text.strip().split(maxsplit=1)
+    command = parts[0].lower().lstrip("/") if parts else ""
+    if command == "companies":
+        return handle_companies(ctx)
+    return dispatch_command(ctx, text), None
+
+
+def dispatch_callback_query(ctx: BotContext, callback_data: str) -> str:
+    """Parse and dispatch a Telegram callback_query's callback_data (sent
+    when the user taps an inline-keyboard button, e.g. a company name in
+    the grouped job digest or /companies). Shared by both transports, same
+    pattern as dispatch_command."""
+    if callback_data.startswith("co:"):
+        return handle_company_jobs_callback(ctx, callback_data)
+    return "Unrecognized selection."
 
 
 def build_bot_context_from_settings() -> BotContext:

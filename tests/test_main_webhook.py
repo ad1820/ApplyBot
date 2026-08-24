@@ -89,6 +89,45 @@ def test_webhook_dispatches_command_and_sends_reply(client, monkeypatch, fake_cl
     assert "Available commands" in sent_messages[0][1]
 
 
+def test_webhook_splits_long_reply_into_multiple_messages(client, monkeypatch, fake_client):
+    """Regression test: Telegram rejects sendMessage with a 400 Bad Request
+    if text exceeds 4096 chars (e.g. /jobs with many results) - the webhook
+    must chunk long replies rather than sending one oversized message."""
+    from app.db.repositories.analytics import AnalyticsEventRepository
+    from app.db.repositories.applications import ApplicationRepository
+    from app.db.repositories.jobs import JobRepository
+
+    ctx = BotContext(
+        jobs=JobRepository(fake_client),
+        applications=ApplicationRepository(fake_client),
+        analytics=AnalyticsEventRepository(fake_client),
+    )
+    monkeypatch.setattr("app.telegram.handlers.build_bot_context_from_settings", lambda: ctx)
+    monkeypatch.setattr("app.telegram.handlers.dispatch_command", lambda ctx, text: "z" * 9000)
+
+    sent_messages = []
+
+    class FakeTelegramBot:
+        def __init__(self, token):
+            pass
+
+        def send_message(self, chat_id, text, **kwargs):
+            sent_messages.append((chat_id, text))
+            return {"result": {"message_id": 1}}
+
+    monkeypatch.setattr("app.telegram.bot.TelegramBot", FakeTelegramBot)
+
+    response = client.post(
+        "/telegram/webhook",
+        json={"update_id": 1, "message": {"chat": {"id": 999}, "text": "/jobs"}},
+    )
+
+    assert response.status_code == 200
+    assert len(sent_messages) > 1
+    assert all(len(text) <= 4096 for _, text in sent_messages)
+    assert "".join(text for _, text in sent_messages) == "z" * 9000
+
+
 def test_webhook_never_500s_even_if_dispatch_fails(client, monkeypatch):
     def broken_context():
         raise RuntimeError("supabase unreachable")

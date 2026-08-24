@@ -11,6 +11,7 @@ any job whose title/company contains such characters (e.g. "R&D Engineer").
 """
 from __future__ import annotations
 
+import hashlib
 from html import escape as _escape
 from typing import Any
 
@@ -20,8 +21,107 @@ def escape_html(value: Any) -> str:
     return _escape(str(value), quote=False)
 
 
+# Telegram rejects sendMessage calls with a 400 Bad Request if `text`
+# exceeds this many characters. Commands like /today or /jobs join many
+# format_job_detail() blocks together and can easily exceed it once there
+# are more than a handful of jobs.
+MAX_MESSAGE_LENGTH = 4096
+
+
+def chunk_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split `text` into chunks Telegram will accept.
+
+    Splits on blank-line boundaries (the separator used between job blocks
+    throughout this module) so a single job's detail is never cut in half
+    across chunks where avoidable. Falls back to a hard slice for the rare
+    case where a single block on its own still exceeds the limit.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if len(block) <= limit:
+            current = block
+        else:
+            for i in range(0, len(block), limit):
+                chunks.append(block[i : i + limit])
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 # Short alias used throughout this module for brevity.
 _e = escape_html
+
+
+def company_callback_hash(company: str) -> str:
+    """Short, deterministic, stateless identifier for a company name, used
+    as Telegram inline-button callback_data (limited to 64 bytes). Hashing
+    rather than using the raw name avoids exceeding that limit for long
+    company names and avoids needing any characters Telegram might mangle.
+    """
+    return hashlib.sha256((company or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def format_company_digest(jobs: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Build a single grouped-by-company digest message (with one inline
+    button per company) instead of one Telegram push per job, so a batch of
+    N new matches produces one message to scan rather than N separate
+    notifications.
+
+    Returns (text, reply_markup) - reply_markup is an inline_keyboard where
+    each button's callback_data is "co:<hash>" (see company_callback_hash),
+    to be resolved back to a company name by the caller when the button is
+    tapped (app.telegram.handlers.handle_company_jobs_callback).
+    """
+    companies: dict[str, int] = {}
+    for job in jobs:
+        company = job.get("company") or "Unknown Company"
+        companies[company] = companies.get(company, 0) + 1
+
+    total = len(jobs)
+    lines = [
+        f"🤖 <b>{total} new matching job{'s' if total != 1 else ''}</b> across "
+        f"{len(companies)} compan{'ies' if len(companies) != 1 else 'y'}:",
+        "",
+        "Tap a company below to see its matching roles.",
+    ]
+    text = "\n".join(lines)
+
+    buttons = [
+        [{"text": f"{company} ({count})", "callback_data": f"co:{company_callback_hash(company)}"}]
+        for company, count in sorted(companies.items())
+    ]
+    reply_markup = {"inline_keyboard": buttons}
+    return text, reply_markup
+
+
+def format_company_jobs(company: str, jobs: list[dict[str, Any]]) -> str:
+    """Render all of one company's matching jobs, shown after the user taps
+    that company's button in the grouped digest (or via /companies)."""
+    if not jobs:
+        return f"No matching jobs found for {_e(company)}."
+    header = f"🏢 <b>{_e(company)}</b> — {len(jobs)} matching role{'s' if len(jobs) != 1 else ''}"
+    blocks = [format_job_notification(job) for job in jobs]
+    return "\n\n".join([header, *blocks])
+
+
+def format_company_list(jobs: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Same grouped company-button layout as format_company_digest, used by
+    the standing /companies command to re-browse currently notified jobs at
+    any time (not just immediately after a discovery run)."""
+    if not jobs:
+        return "No notified jobs yet.", {}
+    return format_company_digest(jobs)
 
 
 def format_job_notification(job: dict[str, Any]) -> str:
@@ -170,6 +270,7 @@ HELP_TEXT = "\n".join(
         "Available commands:",
         "/today - jobs discovered today",
         "/jobs - recent jobs",
+        "/companies - browse notified jobs grouped by company (tap a company to see its roles)",
         "/job &lt;id&gt; - job detail",
         "/done &lt;id&gt; - mark job as applied",
         "/skip &lt;id&gt; - skip a job",

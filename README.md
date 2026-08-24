@@ -6,9 +6,14 @@ The system **never automatically submits applications** and **never stores or
 automates LinkedIn credentials** — you always apply manually and simply tell
 the bot when you're done.
 
-For a practical step-by-step "just tell me the commands" guide, see
-**`HOW_TO_RUN.md`**. This file explains what the system does (Part 1) and
-how to deploy it for real, always-on production use (Part 2).
+**Everyday usage:** run `scripts/run_discovery.py` yourself 2-3 times a day
+(whenever convenient) to find and score new jobs, and
+`scripts/telegram_polling.py` whenever you want the bot to respond to your
+commands. No hosting platform, cron job, or always-on server required. See
+**`DAILY_RUN.md`** for the practical step-by-step version of this workflow.
+See **`HOW_TO_RUN.md`** for a fuller local-setup walkthrough. This file
+covers what the system does (Part 1) and optional always-on/hosted
+deployment if you ever want it (Part 2).
 
 ---
 
@@ -17,33 +22,38 @@ how to deploy it for real, always-on production use (Part 2).
 ## 1. Overview
 
 ```
-Telegram Bot -> FastAPI -> Application/Job Services -> Supabase (source of truth)
-                                                      -> Google Sheets (reporting only)
+You, whenever convenient -> scripts/run_discovery.py -> Supabase (source of truth)
+                                                       -> Google Sheets (reporting only)
+                                                       -> Telegram (alerts)
+
+You, whenever you want    -> scripts/telegram_polling.py -> Telegram (commands: /jobs, /done, ...)
 ```
 
-The agent runs on a schedule (or on demand), discovers jobs from public,
-permitted sources, scores them deterministically against your real skills
-and preferences, filters out irrelevant/low-fit postings, and only pushes a
-Telegram alert for jobs that clear a strict match threshold. You apply
+Each discovery run discovers jobs from public, permitted sources, scores
+them deterministically against your real skills and preferences, filters
+out irrelevant/low-fit postings, and only pushes a Telegram alert + Google
+Sheet row for jobs that clear a strict match threshold. You apply
 manually; the bot just tracks the full lifecycle from there.
 
 Project layout:
 
 ```
 app/
-  main.py            FastAPI app (health, scheduled trigger, telegram webhook)
+  main.py            FastAPI app (health, /run/job-search, /telegram/webhook - optional, see Part 2)
   config.py          Environment-driven settings (pydantic-settings)
   logging_config.py  Structured logging with secret redaction
+  json_config.py     File-or-env-JSON loader for candidate config + Google credentials
   db/                Supabase client + one repository per table
-  jobs/              Job model, JobSource abstraction, dedup, matcher
-  telegram/          Bot client, message templates, command handlers
+  jobs/              Job model, JobSource abstraction, dedup, matcher, skills taxonomy
+  telegram/          Bot client, message templates, command handlers, shared dispatcher
   sheets/            Google Sheets sync (best-effort, never a hard dependency)
-  llm/               LLMProvider abstraction (OpenAI / Anthropic / Null)
+  llm/               LLMProvider interface, ProviderChain (failover), GeminiProvider,
+                     NvidiaNIMProvider, GroqProvider, NullProvider + shared prompts
   services/          JobSearchService - orchestrates a full discovery run
   agents/            V2: resume, cover letter, referral, application, analytics
 supabase/migrations/ SQL schema (V1 + V2 tables)
 config/              candidate_profile.json, job_preferences.json, candidate_skills.json
-scripts/             setup_profile.py, sync_skills.py, telegram_polling.py
+scripts/             run_discovery.py, telegram_polling.py, setup_profile.py, sync_skills.py
 tests/               pytest suite (all offline, no live credentials needed)
 ```
 
@@ -84,7 +94,7 @@ fully without any LLM configured:
   substring matching against the full description) to avoid false positives.
 - **Minimum match threshold** (`MINIMUM_MATCH_SCORE`, default 80) — jobs
   below this are still persisted (visible via `/jobs`) but never pushed as a
-  Telegram notification.
+  Telegram notification or synced to Google Sheets.
 
 ## 4. Persistence & Restart Recovery
 
@@ -94,16 +104,19 @@ in-memory state:
 - `agent_runs` — every discovery run is tracked (`RUNNING` → `COMPLETED` /
   `FAILED` / `PARTIAL`); a crash mid-run is safely resumable, and re-running
   never creates duplicate jobs.
-- `notifications` — every Telegram send is tracked so a restart never
-  results in duplicate alerts for the same job.
+- `notifications` — every Telegram send is tracked so re-running discovery
+  never results in duplicate alerts for the same job.
 - Explicit job status state machine (`DISCOVERED → NOTIFIED →
   INTERESTED/SKIPPED → APPLIED → INTERVIEW → REJECTED/OFFER/WITHDRAWN`),
   persisted and validated against allowed transitions.
 - Per-job and per-source failure isolation — one bad job or one dead source
   never aborts the whole run.
 
-All commands (handlers in `app/telegram/handlers.py`, dispatched by
-`scripts/telegram_polling.py`):
+## 5. Telegram Bot
+
+All commands (handlers in `app/telegram/handlers.py`, dispatched via
+`dispatch_command()` — used identically by `scripts/telegram_polling.py`
+and, if you ever deploy this, `POST /telegram/webhook`):
 
 | Command | Purpose |
 |---|---|
@@ -135,15 +148,73 @@ ever show the same, genuinely strong matches. If Sheets is unconfigured or
 the API call fails, the core pipeline is completely unaffected — Sheets is
 never a hard dependency or the source of truth.
 
-## 7. LLM Provider Abstraction (V2)
+## 7. LLM Provider Architecture
 
-`app/llm/` defines an `LLMProvider` interface with `OpenAIProvider`,
-`AnthropicProvider`, and a `NullProvider` (default — zero LLM calls,
-deterministic matching still fully functional). All job-search-related
+`app/llm/` defines an `LLMProvider` interface and a `ProviderChain` that
+provides automatic failover across multiple providers. All job-search-related
 prompts live in one place: `app/llm/prompts.py`. Every prompt explicitly
 forbids fabricating skills, jobs, degrees, certifications, or experience —
 the LLM is only ever a secondary, bounded opinion; deterministic code always
 makes the final call.
+
+### Two independent provider chains
+
+**Agent reasoning / tool calling:**
+```
+Meta Muse Glimmer 30B (NVIDIA NIM)
+        ↓ transient failure (429, 5xx, timeout)
+Gemini 3.5 Flash-Lite
+        ↓
+Gemini 3.1 Flash-Lite
+        ↓
+Groq model
+        ↓
+NullProvider (safe fallback — no crash)
+```
+
+**Job search / skill matching:**
+```
+Deterministic matcher (always runs first — source of truth)
+        │
+        └── ambiguous skill relationship
+                    ↓
+          Gemini 3.5 Flash-Lite
+                    ↓ failure
+          Gemini 3.1 Flash-Lite
+                    ↓ failure
+          Meta Muse Glimmer 30B (NVIDIA NIM)
+                    ↓ failure
+                  Groq
+                    ↓ failure
+               NullProvider (deterministic result stands)
+```
+
+### Supported configurations
+
+All LLM providers are **optional**. The system starts and runs fully with
+no API keys configured — deterministic matching remains 100% functional:
+
+| What you configure | Reasoning chain | Job matching chain |
+|---|---|---|
+| Nothing | Null | Null |
+| Gemini only | Gemini primary → fallback → Null | Gemini primary → fallback → Null |
+| NVIDIA NIM only | NIM → Null | NIM → Null |
+| Groq only | Groq → Null | Groq → Null |
+| All providers | NIM → Gemini → Gemini → Groq → Null | Gemini → Gemini → NIM → Groq → Null |
+
+### Failover rules
+
+Failover to the next provider happens **only** for transient errors:
+- HTTP 429 (rate limit / quota exhausted)
+- HTTP 5xx (server error, gateway error)
+- Timeout / transient network failure
+
+These errors do **not** trigger failover (they are logged and the chain stops):
+- HTTP 401 (invalid API key) — check your credentials
+- HTTP 400 (bad request) — implementation bug, should surface clearly
+
+The surrounding job discovery pipeline always continues successfully even if
+every LLM provider fails — no LLM call can crash a discovery run.
 
 ## 8. V2 — Resume, Cover Letter, Referral, Application Assistant
 
@@ -172,19 +243,20 @@ makes the final call.
 - Sensitive/ambiguous application questions are never guessed.
 - The Resume/Cover-Letter/Answer agents are explicitly instructed to never
   fabricate skills, jobs, degrees, certifications, or experience.
-- `.env` and `config/candidate_profile.json` (contains PII) are git-ignored.
+- `.env` and the real `config/*.json` files (contain PII/preferences) are
+  git-ignored — only `*.example.json` templates are tracked.
 - Structured logs redact tokens/keys/passwords and avoid unnecessary PII.
 
 ## 10. Testing
 
-`tests/` (160+ tests, fully offline against an in-memory fake Supabase
+`tests/` (200+ tests, fully offline against an in-memory fake Supabase
 client and mocked LLM/HTTP transports — no live credentials required)
 covers: job normalization, deduplication, deterministic scoring (skills,
 role, location/visa, seniority), status transitions, notification
 idempotency, full restart-recovery (`run -> crash -> restart -> continue`),
 per-job/per-source failure isolation, Google Sheets failure resilience,
 malformed job data, LLM failure fallback, application-answer
-classification, and Telegram message HTML-safety.
+classification, Telegram message HTML-safety, and command dispatch.
 
 ```powershell
 .\venv\Scripts\python -m pytest -v
@@ -192,238 +264,67 @@ classification, and Telegram message HTML-safety.
 
 ---
 
-# Part 2 — Production Setup
+# Part 2 — Optional Always-On Deployment
 
-This section covers deploying the agent so it runs unattended: a scheduled
-discovery job, an always-listening Telegram bot, and persistent state that
-survives restarts/redeploys. See `HOW_TO_RUN.md` for local development.
+**You don't need any of this.** The everyday workflow (`DAILY_RUN.md`) is
+just running `scripts/run_discovery.py` and `scripts/telegram_polling.py`
+yourself, 2-3 times a day, on your own machine — no hosting, no cron job,
+no server that has to stay online. This section exists only for reference
+if you ever *do* want it to run unattended somewhere.
 
-**Recommended setup (fully free-tier):** Supabase hosts the database and
-the scheduler (`pg_cron`/`pg_net`), and a single free Render Web Service
-(or any host with a free always-on web tier - Railway, Fly.io, etc.) runs
-the FastAPI app. Telegram delivers commands via **webhook** straight to
-that same Web Service (`POST /telegram/webhook`), and Supabase Cron
-triggers scheduled discovery via HTTPS (`POST /run/job-search`) - so
-**no paid Background Worker or Cron Job is required anywhere**. This
-avoids needing a second always-on process, which many hosting providers'
-free tiers don't include (e.g. Render's free tier only covers Web
-Services).
+## 11. Environment Variables
 
-If your host *does* offer a free/cheap always-on worker or native Cron
-Job, you can instead run `scripts/telegram_polling.py` as a second process
-and/or point a native scheduler directly at `scripts/run_discovery.py` -
-both paths share the exact same underlying logic
-(`app.telegram.handlers.dispatch_command` and
-`app.agents.job_agent.run_job_search` respectively), so behavior is
-identical either way.
+Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`.**
 
-## 11. Prerequisites for Production
-
-- A hosting platform that can run a Docker container or a Python process
-  continuously (Railway, Render, Fly.io, a VPS, etc.) for the FastAPI app
-  and the Telegram poller.
-- A production Supabase project (the free tier works fine for a single user).
-- A dedicated Telegram bot (via @BotFather) — don't reuse a dev/test bot token.
-- (Recommended) An LLM API key (OpenAI or Anthropic) for semantic skill
-  matching and resume/cover-letter generation.
-- (Optional) A Google Cloud service account for Sheets sync.
-- A scheduler that can make an authenticated HTTPS POST on a cadence
-  (Supabase Cron, a cron job on your host, GitHub Actions, cron-job.org, etc.).
-
-## 12. Environment Variables (production values)
-
-Copy `.env.example` to `.env` (or set these as real environment variables /
-secrets in your hosting platform — **never bake secrets into the Docker
-image**):
-
-| Variable | Production guidance |
+| Variable | Purpose |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_KEY` | Use the **service_role** key. Base URL only — no trailing slash, no `/rest/v1` (see `PGRST125` note below). |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | A dedicated production bot token. |
-| `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL` | Set a real provider (`openai`/`anthropic`) for full V2 functionality; `null` still works for V1-only deterministic matching. |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | Mount the JSON key file into the container (e.g. as a secret file) and point this at its in-container path. |
-| `GOOGLE_SHEETS_SPREADSHEET_ID` | Your production tracking spreadsheet ID. |
-| `MINIMUM_MATCH_SCORE` | Tune to taste; 80 is strict by design. |
-| `SCHEDULER_SECRET` | A long random string — required to prevent unauthenticated callers from triggering `/run/job-search`. Generate with `openssl rand -hex 32` or similar. |
-| `APP_TIMEZONE` | Your real timezone, e.g. `Asia/Kolkata`. |
-| `LOG_LEVEL` | `INFO` in production; avoid `DEBUG` long-term (verbose). |
+| `SUPABASE_URL`, `SUPABASE_KEY` | Supabase project connection (service role key). `SUPABASE_URL` must be just the base URL (`https://xxxxx.supabase.co`), no trailing slash or `/rest/v1` — that causes a `PGRST125` error. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Your personal Telegram bot + chat to notify |
+| `GEMINI_API_KEY` | Google Gemini API key (optional — used in both chains) |
+| `GEMINI_PRIMARY_MODEL` | Primary Gemini model (default: `gemini-3.5-flash-lite`) |
+| `GEMINI_FALLBACK_MODEL` | Fallback Gemini model (default: `gemini-3.1-flash-lite`) |
+| `NVIDIA_NIM_API_KEY` | NVIDIA NIM API key (optional — primary reasoning model) |
+| `NVIDIA_NIM_MODEL` | NVIDIA NIM model (default: `meta/muse-glimmer-30b`) |
+| `GROQ_API_KEY` | Groq Cloud API key (optional — last fallback in both chains) |
+| `GROQ_MODEL` | Groq model to use (e.g. `openai/gpt-oss-120b`; leave blank to skip Groq) |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` / `GOOGLE_SERVICE_ACCOUNT_JSON` | Sheets sync credentials — file path (local) or raw JSON content (fallback) |
+| `GOOGLE_SHEETS_SPREADSHEET_ID` | Target spreadsheet ID |
+| `MINIMUM_MATCH_SCORE` | Minimum score (0-100) before a job is pushed to Telegram/Sheets. Default `82`. |
+| `APP_TIMEZONE` | e.g. `Asia/Kolkata` |
+| `SCHEDULER_SECRET` | Only needed if exposing `/run/job-search` over HTTP |
+| `CANDIDATE_PROFILE_JSON`, `JOB_PREFERENCES_JSON`, `CANDIDATE_SKILLS_JSON` | Fallback env vars for the matching `config/*.json` files |
 
-## 13. Database Setup (production Supabase project)
+## 12. If you ever host this somewhere
 
-1. Create a **separate Supabase project for production** (don't share with
-   a dev/test project).
-2. In the SQL Editor, run `supabase/migrations/0001_init.sql`, then
-   `supabase/migrations/0002_related_skills.sql`, in order. Both are
-   idempotent (`if not exists`).
-3. RLS is left disabled by design — only the trusted backend (service role
-   key) talks to Supabase. Never expose the service role key to any
-   client-side code or public endpoint.
+- **FastAPI app** (`app/main.py`) exposes `GET /health`, `POST
+  /run/job-search` (HTTP-triggered discovery, guarded by
+  `X-Scheduler-Secret`), and `POST /telegram/webhook` (dispatches Telegram
+  commands exactly like `scripts/telegram_polling.py`, so you could point
+  a webhook at it instead of running the polling script).
+- Both `/run/job-search` and `scripts/run_discovery.py` call the exact same
+  `app.agents.job_agent.run_job_search()` — behavior is identical whether
+  triggered by you locally, an HTTP call, or a scheduler.
+- A `Dockerfile` is included; its `CMD` reads the `$PORT` env var if set
+  (falls back to `8000`), so it adapts to platforms that assign their own
+  port.
+- Any external scheduler (Supabase Cron via `pg_cron`/`pg_net`, a host's
+  native cron feature, GitHub Actions, etc.) can call `/run/job-search` on
+  a schedule if you want fully unattended operation later. This is
+  intentionally not documented in depth here since it's not how you
+  currently run this — see `HOW_TO_RUN.md` if you want to explore it.
 
-## 14. Set Your Profile, Preferences, and Skills
-
-Before your first production run, populate your real data (see Part 1 for
-the underlying tables):
-
-```bash
-cp config/candidate_profile.example.json config/candidate_profile.json
-# edit config/candidate_profile.json, config/job_preferences.json, config/candidate_skills.json
-python scripts/setup_profile.py
-python scripts/sync_skills.py
-```
-
-Send your resume once the bot is live: `/setresume <paste your resume text>`.
-
-## 15. Build and Run with Docker
-
-```bash
-docker build -t job-application-agent .
-docker run -d --name job-agent \
-  --env-file .env \
-  -v /path/to/google_service_account.json:/app/google_service_account.json:ro \
-  -p 8000:8000 \
-  job-application-agent
-```
-
-The image runs the FastAPI app (`app.main:app`) on port 8000, exposing
-`/health`, `/run/job-search`, and `/telegram/webhook`. The `Dockerfile`
-copies `app/`, `scripts/`, `supabase/`, and `config/` — mount your real
-`.env` and Google service-account file as shown above rather than baking
-them into the image.
-
-## 16. Run the Telegram Bot Process
-
-**Option A — Webhook (recommended, no extra process needed)**
-
-`POST /telegram/webhook` is fully wired up: it dispatches every command
-through `app.telegram.handlers.dispatch_command` and replies via Telegram,
-using the exact same logic as the polling script. Just point Telegram's
-webhook at your deployed FastAPI Web Service:
-
-```bash
-curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<your-host>/telegram/webhook"
-curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"   # verify: no last_error_message
-```
-
-This is the best option when your hosting plan has no free always-on
-worker process (e.g. Render's free tier only covers Web Services) - the
-same Web Service that serves `/health` and `/run/job-search` also handles
-the bot, with zero extra infrastructure.
-
-**Option B — Long-polling worker (if you have a free/cheap always-on process)**
-
-Run `scripts/telegram_polling.py` as a second, always-on process (a second
-container, a systemd service, a Background Worker, etc.):
-
-```bash
-python scripts/telegram_polling.py
-```
-
-If you switch to this, first remove the webhook (`.../deleteWebhook`) -
-Telegram only delivers updates through one transport at a time. Only run
-**one** instance at a time either way; Telegram rejects concurrent
-`getUpdates` long-polling clients on the same bot token. There is no
-message-loss risk switching between the two: Telegram queues updates for
-a period if neither transport is active, and this project's notification
-tracking (`notifications` table) prevents duplicate job alerts once
-delivery resumes.
-
-## 17. Schedule Job Discovery
-
-**Recommended: Supabase Cron** (`pg_cron` + `pg_net`), since it is free
-and needs no extra hosting — Supabase's own Postgres instance triggers an
-HTTPS call to your deployed app on a schedule.
-
-1. In the Supabase Dashboard → **Database** → **Extensions**, enable
-   `pg_cron` and `pg_net` (or via SQL: `create extension if not exists pg_cron;`
-   and `create extension if not exists pg_net;`).
-2. In the SQL Editor, schedule the trigger (replace the URL and secret with
-   your real values):
-   ```sql
-   select cron.schedule(
-     'daily-job-search',              -- job name (must be unique)
-     '30 2 * * *',                    -- cron syntax, ALWAYS IN UTC (e.g. 08:00 IST = 02:30 UTC)
-     $$
-     select net.http_post(
-       url := 'https://<your-host>/run/job-search',
-       headers := jsonb_build_object(
-         'Content-Type', 'application/json',
-         'X-Scheduler-Secret', '<your SCHEDULER_SECRET>'
-       ),
-       body := '{}'::jsonb,
-       timeout_milliseconds := 30000
-     ) as request_id;
-     $$
-   );
-   ```
-3. Verify it was scheduled: `select * from cron.job;`
-4. Inspect run history / debug failures:
-   `select * from cron.job_run_details where jobname = 'daily-job-search' order by start_time desc limit 10;`
-5. To change or remove it later: `select cron.unschedule('daily-job-search');`
-   then re-run `cron.schedule(...)` with new values.
-
-**Alternatives** if you would rather not use Supabase Cron:
-- A cron job on your host: `0 8 * * * curl -X POST ... -H "X-Scheduler-Secret: ..."`.
-- GitHub Actions scheduled workflow, or any third-party cron-as-a-service,
-  calling the same endpoint.
-- If your host has a native, free Cron Job feature that can run a command
-  directly (not just an HTTP call), point it at
-  `python scripts/run_discovery.py` instead - it wraps the exact same
-  `run_job_search()` logic with no HTTP hop needed.
-
-Pick a cadence appropriate for the sources you use (e.g. once or twice
-daily) — remember RemoteOK/Remotive/etc. have their own rate-limit
-expectations (see `app/jobs/discovery.py` docstrings). Every run is
-idempotent, so more frequent runs are safe but wasteful, not harmful.
-
-## 18. Verify the Deployment
-
-```bash
-curl https://<your-host>/health
-```
-
-Expect `{"status":"ok","supabase":"connected","telegram":"configured"}`.
-Then trigger one discovery run manually and confirm:
-1. New jobs appear in Supabase (`jobs` table) and, if configured, your
-   Google Sheet.
-2. Jobs meeting your `MINIMUM_MATCH_SCORE` arrive as Telegram messages.
-3. `/jobs`, `/stats`, etc. respond correctly from your Telegram client.
-4. Re-triggering the same run produces `jobs_duplicate` equal to the
-   previous run's `jobs_new`, and no duplicate Telegram messages — this is
-   the mandatory restart-recovery guarantee.
-
-## 19. Operational Notes
-
-- **Logs** are structured JSON (see `app/logging_config.py`) with secrets
-  redacted — safe to forward to any log aggregator.
-- **Failure isolation** — one bad job or one dead source never aborts a
-  run; check `agent_runs.error_message` for partial-failure details.
-- **Google Sheets outages** never block the pipeline — check
-  `agent_runs`/application logs for sync failures and re-sync manually if
-  needed; Sheets is not the source of truth.
-- **Rotating secrets** — if you rotate `TELEGRAM_BOT_TOKEN`, `SUPABASE_KEY`,
-  or `LLM_API_KEY`, update your host's environment variables and redeploy
-  (and re-run `setWebhook` if `TELEGRAM_BOT_TOKEN` changes).
-- **Scaling** — this is designed for a single user; if you do run
-  `scripts/telegram_polling.py` instead of the webhook, only run one
-  instance at a time (Telegram rejects concurrent `getUpdates` long-polling
-  clients on the same bot token), and don't set a webhook simultaneously.
-
-## 20. Production Troubleshooting
+## 13. Troubleshooting
 
 - **`PGRST125` / "Invalid path"** → `SUPABASE_URL` has a trailing slash or
   `/rest/v1` suffix; also auto-normalized in `app/config.py`, but fix at the source.
-- **Telegram bot not responding (webhook mode)** → check
-  `getWebhookInfo` for a `last_error_message`; confirm your deployed app is
-  reachable and `/telegram/webhook` returns 200; check your host's logs for
-  errors during `dispatch_command`.
-- **Telegram bot not responding (polling mode)** → confirm
-  `scripts/telegram_polling.py` is still running as a live process, and
-  that no webhook is also set (`getWebhookInfo` should show an empty `url`).
-- **Google Sheets `403`/API-disabled** → share the sheet with the service
+- **No Telegram replies** → `scripts/telegram_polling.py` isn't running
+  right now; start it (see `DAILY_RUN.md`).
+- **Nothing ever gets notified/synced to Sheets** → check
+  `MINIMUM_MATCH_SCORE`, your `preferred_roles`/skills in Supabase, and
+  that `config/candidate_skills.json` was synced via `scripts/sync_skills.py`.
+- **Google Sheets `403`/API-disabled** → share the sheet with your service
   account's `client_email` as Editor, and enable the Sheets API in Google
-  Cloud Console.
-- **Nothing ever gets notified** → check `MINIMUM_MATCH_SCORE`, your
-  `preferred_roles`/skills in Supabase, and that `config/candidate_skills.json`
-  has actually been synced via `scripts/sync_skills.py`.
+  Cloud Console; or leave Sheets unconfigured entirely (it's optional).
 
-For a full step-by-step local setup walkthrough, see **`HOW_TO_RUN.md`**.
+For the everyday workflow, see **`DAILY_RUN.md`**. For a fuller local-setup
+walkthrough, see **`HOW_TO_RUN.md`**.

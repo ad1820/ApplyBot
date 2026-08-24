@@ -59,10 +59,40 @@ class TelegramBot:
         return response.json()
 
     def get_updates(self, offset: Optional[int] = None, timeout: int = 30) -> dict[str, Any]:
+        """Long-poll for new updates.
+
+        Telegram holds the HTTP connection open for up to `timeout` seconds
+        waiting for a new update before responding (possibly with an empty
+        result). The HTTP client's own read timeout must therefore be
+        comfortably longer than `timeout`, or httpx will raise a
+        ReadTimeout well before Telegram ever responds - this is a normal,
+        expected occurrence during long-polling (it just means no new
+        messages arrived in the window), not an error, so callers should
+        treat httpx.TimeoutException from this method as "no updates yet"
+        and simply poll again.
+        """
         params: dict[str, Any] = {"timeout": timeout}
         if offset is not None:
             params["offset"] = offset
-        response = self._client.get(f"{self._base_url}/getUpdates", params=params)
+        # Add a generous buffer on top of Telegram's own long-poll window so
+        # the client doesn't time out just before Telegram would have
+        # responded.
+        request_timeout = httpx.Timeout(timeout + 10.0, connect=10.0)
+        response = self._client.get(f"{self._base_url}/getUpdates", params=params, timeout=request_timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def delete_webhook(self) -> dict[str, Any]:
+        """Telegram only delivers updates via ONE transport at a time - if a
+        webhook is set, long-polling (getUpdates) fails with 409 Conflict.
+        Called defensively on polling startup so switching between webhook
+        and polling never requires a manual deleteWebhook call."""
+        response = self._client.get(f"{self._base_url}/deleteWebhook")
+        response.raise_for_status()
+        return response.json()
+
+    def get_webhook_info(self) -> dict[str, Any]:
+        response = self._client.get(f"{self._base_url}/getWebhookInfo")
         response.raise_for_status()
         return response.json()
 

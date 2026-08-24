@@ -90,6 +90,107 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
+class LeverSource(JobSource):
+    """Uses Lever's public postings API (no auth required, permitted for
+    programmatic access): https://api.lever.co/v0/postings/{company}?mode=json
+    """
+
+    name = "lever"
+
+    def __init__(self, company_slugs: list[str], client: httpx.Client | None = None):
+        self.company_slugs = company_slugs
+        self._client = client or httpx.Client(timeout=15.0)
+
+    def search_jobs(self, preferences: dict[str, Any]) -> list[Job]:
+        jobs: list[Job] = []
+        for company in self.company_slugs:
+            try:
+                url = f"https://api.lever.co/v0/postings/{company}?mode=json"
+                response = self._client.get(url)
+                response.raise_for_status()
+                data = response.json()
+            except (httpx.HTTPError, ValueError):
+                # One company's board being unavailable must not break the
+                # whole run.
+                continue
+            if not isinstance(data, list):
+                continue
+            for raw in data:
+                jobs.append(self._normalize(raw, company))
+        return jobs
+
+    def _normalize(self, raw: dict[str, Any], company: str) -> Job:
+        categories = raw.get("categories") or {}
+        location = categories.get("location")
+        description = raw.get("descriptionPlain") or raw.get("description") or ""
+        commitment = categories.get("commitment") or ""
+        return Job(
+            external_id=str(raw.get("id")),
+            source=self.name,
+            company=company,
+            title=raw.get("text", "Unknown Title"),
+            location=location,
+            work_mode=_guess_work_mode(f"{location} {commitment} {description}"),
+            description=description,
+            url=raw.get("hostedUrl") or raw.get("applyUrl"),
+            posted_at=_parse_lever_timestamp(raw.get("createdAt")),
+            discovered_at=datetime.now(timezone.utc),
+        )
+
+
+def _parse_lever_timestamp(value: Any) -> datetime | None:
+    """Lever's createdAt is epoch milliseconds, not an ISO string."""
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+class AshbySource(JobSource):
+    """Uses Ashby's public job board API (no auth required, permitted for
+    programmatic access): https://api.ashbyhq.com/posting-api/job-board/{company}
+    """
+
+    name = "ashby"
+
+    def __init__(self, company_slugs: list[str], client: httpx.Client | None = None):
+        self.company_slugs = company_slugs
+        self._client = client or httpx.Client(timeout=15.0)
+
+    def search_jobs(self, preferences: dict[str, Any]) -> list[Job]:
+        jobs: list[Job] = []
+        for company in self.company_slugs:
+            try:
+                url = f"https://api.ashbyhq.com/posting-api/job-board/{company}"
+                response = self._client.get(url)
+                response.raise_for_status()
+                data = response.json()
+            except (httpx.HTTPError, ValueError):
+                continue
+            for raw in data.get("jobs", []):
+                jobs.append(self._normalize(raw, company))
+        return jobs
+
+    def _normalize(self, raw: dict[str, Any], company: str) -> Job:
+        location = raw.get("location")
+        description = raw.get("descriptionPlain") or raw.get("descriptionHtml") or ""
+        workplace_type = raw.get("workplaceType") or ""
+        return Job(
+            external_id=str(raw.get("id")),
+            source=self.name,
+            company=company,
+            title=raw.get("title", "Unknown Title"),
+            location=location,
+            work_mode=_guess_work_mode(f"{location} {workplace_type} {description}"),
+            description=description,
+            url=raw.get("jobUrl") or raw.get("applyUrl"),
+            posted_at=_parse_datetime(raw.get("publishedAt")),
+            discovered_at=datetime.now(timezone.utc),
+        )
+
+
 class RemoteOKSource(JobSource):
     """Uses RemoteOK's public JSON feed: https://remoteok.com/api
     Documented as free for personal/non-commercial use with attribution.

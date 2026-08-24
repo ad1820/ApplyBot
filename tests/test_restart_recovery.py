@@ -23,12 +23,14 @@ class StaticSource(JobSource):
 class FakeTelegramBot:
     def __init__(self, fail=False):
         self.sent = []
+        self.sent_markup = []
         self.fail = fail
 
     def send_message(self, chat_id, text, reply_markup=None, parse_mode="HTML"):
         if self.fail:
             raise RuntimeError("telegram down")
         self.sent.append((chat_id, text))
+        self.sent_markup.append(reply_markup)
         return {"result": {"message_id": len(self.sent)}}
 
 
@@ -268,3 +270,62 @@ def test_mismatched_role_job_is_not_synced_to_sheets(fake_client):
 
     assert result["jobs_new"] == 1
     assert synced_jobs == []  # Sheets must mirror Telegram - role mismatch skips both
+
+
+def test_multiple_matching_jobs_sent_as_single_grouped_digest(fake_client):
+    """Regression test: a run finding several matching jobs must send ONE
+    grouped-by-company digest message, not one push per job."""
+    bot = FakeTelegramBot()
+    jobs = [
+        sample_job(title="Backend Engineer", company="Acme", location="India", skills=["python"]),
+        sample_job(title="Platform Engineer", company="Acme", location="India", skills=["python"], external_id="2"),
+        sample_job(title="Backend Engineer", company="OpenAI", location="India", skills=["python"], external_id="3"),
+    ]
+    service = build_service(fake_client, jobs, telegram_bot=bot, minimum_match_score=0.0)
+
+    result = service.run({"skills": ["python"]}, {})
+
+    assert result["jobs_notified"] == 3
+    assert len(bot.sent) == 1  # exactly one digest message, not three
+    digest_text = bot.sent[0][1]
+    assert "3 new matching jobs" in digest_text
+    assert "2 companies" in digest_text
+
+    # Company names/counts are on the inline-keyboard buttons, not the text.
+    markup = bot.sent_markup[0]
+    button_labels = [btn["text"] for row in markup["inline_keyboard"] for btn in row]
+    assert "Acme (2)" in button_labels
+    assert "OpenAI (1)" in button_labels
+
+    job_repo = JobRepository(fake_client)
+    statuses = {j["status"] for j in job_repo.list_recent(limit=10)}
+    assert statuses == {"NOTIFIED"}
+
+
+def test_no_matching_jobs_sends_no_digest(fake_client):
+    bot = FakeTelegramBot()
+    job = sample_job(title="Backend Engineer")  # low score, no telegram config match
+    service = build_service(fake_client, [job], telegram_bot=bot, minimum_match_score=100.0)
+
+    service.run({"skills": []}, {})
+
+    assert bot.sent == []
+
+
+def test_fresher_hiring_roles_are_merged_into_preferred_roles(fake_client, tmp_path, monkeypatch):
+    """A job whose title matches a fresher_hiring_roles.txt phrase (but not
+    anything explicitly listed in preferences) must still be notified."""
+    roles_file = tmp_path / "fresher_hiring_roles.txt"
+    roles_file.write_text("Software Development Engineer (SDE)\n", encoding="utf-8")
+    monkeypatch.setattr("app.jobs.fresher_roles._ROLES_FILE", roles_file)
+
+    bot = FakeTelegramBot()
+    job = sample_job(title="SDE", location="India", skills=["python"])
+    service = build_service(fake_client, [job], telegram_bot=bot, minimum_match_score=0.0)
+
+    # preferences only lists an unrelated role - "SDE" only matches via the
+    # fresher_hiring_roles.txt augmentation.
+    result = service.run({"skills": ["python"]}, {"preferred_roles": ["Data Scientist"]})
+
+    assert result["jobs_notified"] == 1
+    assert len(bot.sent) == 1

@@ -259,7 +259,15 @@ def make_llm_semantic_skill_checker(llm_provider: Any) -> Callable[[str, set[str
             return None
         system, user = semantic_skill_check_prompt(job_skill, candidate_skills)
         try:
-            response = llm_provider.complete(user, system=system, max_tokens=5)
+            # 5 tokens is enough for a plain "yes"/"no" from a non-reasoning
+            # model, but reasoning-capable providers (e.g. Nvidia Nemotron,
+            # Groq's gpt-oss/qwen models) still spend a handful of tokens on
+            # a minimal reasoning pass before the answer even with
+            # reasoning effort minimized - confirmed via live testing that
+            # 5 tokens reliably truncates them before they ever answer. 50
+            # is a small, cheap budget that reliably accommodates that
+            # minimal reasoning across all currently supported providers.
+            response = llm_provider.complete(user, system=system, max_tokens=50)
         except LLMError:
             return None
         if response and response.strip().lower().startswith("yes"):

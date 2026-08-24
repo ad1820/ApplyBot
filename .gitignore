@@ -12,6 +12,9 @@ build/
 htmlcov/
 .vscode/
 *.log
+logs/
+companies_hiring_in_india.txt
+fresher_hiring_roles.txt
 
 # Google service account key files (any name) - never commit real
 # credentials. In production, paste the same JSON content into the

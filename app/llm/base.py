@@ -15,6 +15,17 @@ class LLMError(RuntimeError):
     gracefully (e.g. fall back to deterministic logic) rather than crash."""
 
 
+class LLMTransientError(LLMError):
+    """Raised for retryable / transient provider failures: HTTP 429 (rate
+    limit), quota exhausted, 5xx server errors, timeouts, and transient
+    network failures. The ProviderChain uses this to decide whether to fail
+    over to the next provider in the chain.
+
+    Do NOT raise this for programming errors (400 bad request), auth failures
+    (401 / 403), or response-parsing bugs — those are non-retryable and should
+    be surfaced as plain LLMError so they are not silently swallowed."""
+
+
 class LLMProvider(ABC):
     name: str = "base"
 
