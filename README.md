@@ -19,9 +19,18 @@ deployment if you ever want it (Part 2).
 
 # Part 1 — Functionality
 
-## 1. Overview
+## 1. Key Advancements & Features
 
-```
+- **Multi-LLM Provider Architecture**: Intelligent fallback chain routing across Google Gemini, NVIDIA NIM, and Groq. Handles 429 rate limits dynamically (e.g. chaining multiple Groq models together to bypass daily limits).
+- **Built-in Local ATS Checker**: A free, on-demand ATS resume scanner (via the `/resume` command) that compares your master resume against any job description using your local LLM chain to provide skills-gap analysis and tailored drafts.
+- **Smart Early Filtering**: Instantly discards irrelevant titles (e.g., "Senior", "Sales", "Staff") before processing, saving LLM tokens and API calls.
+- **Dual-Synced Google Sheets**: Automatically logs matched jobs to a Master sheet *and* a Date-wise tab (e.g., `2026-08-25`), complete with auto-formatting, frozen headers, and professional styling.
+- **Resilient & Stateless Discovery**: Fully crash-proof pipeline. If stopped mid-run, it picks up right where it left off, skipping already-persisted jobs via canonical deduplication.
+- **Extensive Public API Job Sources**: Pulls seamlessly from dozens of open APIs like Jobicy, Arbeitnow, RemoteOK, Remotive, and hundreds of ATS boards (Greenhouse, Lever, Ashby).
+
+## 2. Overview
+
+```text
 You, whenever convenient -> scripts/run_discovery.py -> Supabase (source of truth)
                                                        -> Google Sheets (reporting only)
                                                        -> Telegram (alerts)
@@ -57,7 +66,7 @@ scripts/             run_discovery.py, telegram_polling.py, setup_profile.py, sy
 tests/               pytest suite (all offline, no live credentials needed)
 ```
 
-## 2. Job Discovery
+## 3. Job Discovery
 
 - Modular `JobSource` abstraction (`app/jobs/discovery.py`) — no scraping of
   platforms that prohibit it, only genuine public APIs/RSS feeds:
@@ -71,7 +80,7 @@ tests/               pytest suite (all offline, no live credentials needed)
   equality alone. Duplicate postings from multiple sources are merged, not
   re-created (`job_sources` table preserves the source history).
 
-## 3. Job Matching & Filtering
+## 4. Job Matching & Filtering
 
 All scoring is deterministic (`app/jobs/matcher.py`) — the system works
 fully without any LLM configured:
@@ -96,7 +105,7 @@ fully without any LLM configured:
   below this are still persisted (visible via `/jobs`) but never pushed as a
   Telegram notification or synced to Google Sheets.
 
-## 4. Persistence & Restart Recovery
+## 5. Persistence & Restart Recovery
 
 Supabase/Postgres is the single source of truth — nothing relies on
 in-memory state:
@@ -112,7 +121,7 @@ in-memory state:
 - Per-job and per-source failure isolation — one bad job or one dead source
   never aborts the whole run.
 
-## 5. Telegram Bot
+## 6. Telegram Bot
 
 All commands (handlers in `app/telegram/handlers.py`, dispatched via
 `dispatch_command()` — used identically by `scripts/telegram_polling.py`
@@ -136,7 +145,7 @@ bot never submits anything on your behalf. All message content is
 HTML-escaped before sending, so dynamic job titles/company names can never
 break message delivery.
 
-## 6. Google Sheets Sync (optional, reporting-only)
+## 7. Google Sheets Sync (optional, reporting-only)
 
 Best-effort sync to a spreadsheet (Date Found, Company, Role, Location,
 Work Mode, Match Score, Status, Application Date, Resume Version, Referral
@@ -148,7 +157,7 @@ ever show the same, genuinely strong matches. If Sheets is unconfigured or
 the API call fails, the core pipeline is completely unaffected — Sheets is
 never a hard dependency or the source of truth.
 
-## 7. LLM Provider Architecture
+## 8. LLM Provider Architecture
 
 `app/llm/` defines an `LLMProvider` interface and a `ProviderChain` that
 provides automatic failover across multiple providers. All job-search-related
@@ -216,7 +225,7 @@ These errors do **not** trigger failover (they are logged and the chain stops):
 The surrounding job discovery pipeline always continues successfully even if
 every LLM provider fails — no LLM call can crash a discovery run.
 
-## 8. V2 — Resume, Cover Letter, Referral, Application Assistant
+## 9. V2 — Resume, Cover Letter, Referral, Application Assistant
 
 - **Master resume** — versioned (`master_resumes` table), never overwritten;
   every tailored resume references the exact version it was derived from.
@@ -235,7 +244,7 @@ every LLM provider fails — no LLM call can crash a discovery run.
 - **Analytics** — simple statistics (application/interview/offer rates,
   breakdowns by role/location/tech/match-score bucket) — no ML.
 
-## 9. Security & Safety Guarantees
+## 10. Security & Safety Guarantees
 
 - No LinkedIn credentials are ever stored or used; no LinkedIn automation.
 - No autonomous application submission — every application is manual.
@@ -247,7 +256,7 @@ every LLM provider fails — no LLM call can crash a discovery run.
   git-ignored — only `*.example.json` templates are tracked.
 - Structured logs redact tokens/keys/passwords and avoid unnecessary PII.
 
-## 10. Testing
+## 11. Testing
 
 `tests/` (200+ tests, fully offline against an in-memory fake Supabase
 client and mocked LLM/HTTP transports — no live credentials required)
@@ -272,7 +281,7 @@ yourself, 2-3 times a day, on your own machine — no hosting, no cron job,
 no server that has to stay online. This section exists only for reference
 if you ever *do* want it to run unattended somewhere.
 
-## 11. Environment Variables
+## 12. Environment Variables
 
 Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`.**
 
@@ -286,15 +295,14 @@ Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`.**
 | `NVIDIA_NIM_API_KEY` | NVIDIA NIM API key (optional — primary reasoning model) |
 | `NVIDIA_NIM_MODEL` | NVIDIA NIM model (default: `meta/muse-glimmer-30b`) |
 | `GROQ_API_KEY` | Groq Cloud API key (optional — last fallback in both chains) |
-| `GROQ_MODEL` | Groq model to use (e.g. `openai/gpt-oss-120b`; leave blank to skip Groq) |
+| `GROQ_MODELS` | Comma-separated Groq models to use (e.g. `openai/gpt-oss-120b,openai/gpt-oss-20b`; leave blank to skip Groq) |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` / `GOOGLE_SERVICE_ACCOUNT_JSON` | Sheets sync credentials — file path (local) or raw JSON content (fallback) |
-| `GOOGLE_SHEETS_SPREADSHEET_ID` | Target spreadsheet ID |
 | `MINIMUM_MATCH_SCORE` | Minimum score (0-100) before a job is pushed to Telegram/Sheets. Default `82`. |
 | `APP_TIMEZONE` | e.g. `Asia/Kolkata` |
 | `SCHEDULER_SECRET` | Only needed if exposing `/run/job-search` over HTTP |
 | `CANDIDATE_PROFILE_JSON`, `JOB_PREFERENCES_JSON`, `CANDIDATE_SKILLS_JSON` | Fallback env vars for the matching `config/*.json` files |
 
-## 12. If you ever host this somewhere
+## 13. If you ever host this somewhere
 
 - **FastAPI app** (`app/main.py`) exposes `GET /health`, `POST
   /run/job-search` (HTTP-triggered discovery, guarded by
@@ -313,7 +321,7 @@ Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`.**
   intentionally not documented in depth here since it's not how you
   currently run this — see `HOW_TO_RUN.md` if you want to explore it.
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 - **`PGRST125` / "Invalid path"** → `SUPABASE_URL` has a trailing slash or
   `/rest/v1` suffix; also auto-normalized in `app/config.py`, but fix at the source.

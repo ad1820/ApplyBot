@@ -407,6 +407,69 @@ class WeWorkRemotelySource(JobSource):
         return jobs
 
 
+
+class JobicySource(JobSource):
+    """Uses Jobicy's public API: https://jobicy.com/api/v2/remote-jobs"""
+    name = "jobicy"
+    def __init__(self, industry: str = "engineering", client: httpx.Client | None = None):
+        self.industry = industry
+        self._client = client or httpx.Client(timeout=15.0)
+
+    def search_jobs(self, preferences: dict[str, Any]) -> list[Job]:
+        try:
+            response = self._client.get("https://jobicy.com/api/v2/remote-jobs", params={"industry": self.industry})
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError):
+            return []
+        return [self._normalize(raw) for raw in data.get("jobs", [])]
+
+    def _normalize(self, raw: dict[str, Any]) -> Job:
+        return Job(
+            external_id=str(raw.get("id")),
+            source=self.name,
+            company=raw.get("companyName", "Unknown"),
+            title=raw.get("jobTitle", "Unknown Title"),
+            location=raw.get("jobGeo") or "Remote",
+            work_mode=WorkMode.REMOTE,
+            description=raw.get("jobDescription") or "",
+            url=raw.get("url"),
+            posted_at=_parse_datetime(raw.get("pubDate")),
+            discovered_at=datetime.now(timezone.utc),
+        )
+
+class ArbeitnowSource(JobSource):
+    """Uses Arbeitnow's public API: https://www.arbeitnow.com/api/job-board-api"""
+    name = "arbeitnow"
+    def __init__(self, client: httpx.Client | None = None):
+        self._client = client or httpx.Client(timeout=15.0)
+
+    def search_jobs(self, preferences: dict[str, Any]) -> list[Job]:
+        try:
+            response = self._client.get("https://www.arbeitnow.com/api/job-board-api")
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError):
+            return []
+        return [self._normalize(raw) for raw in data.get("data", [])]
+
+    def _normalize(self, raw: dict[str, Any]) -> Job:
+        tags = raw.get("tags") or []
+        location = raw.get("location") or "Remote"
+        return Job(
+            external_id=str(raw.get("slug") or raw.get("url")),
+            source=self.name,
+            company=raw.get("company_name", "Unknown"),
+            title=raw.get("title", "Unknown Title"),
+            location=location,
+            work_mode=WorkMode.REMOTE if raw.get("remote") else WorkMode.HYBRID,
+            description=raw.get("description") or "",
+            skills=[str(t) for t in tags],
+            url=raw.get("url"),
+            posted_at=_parse_datetime(raw.get("created_at")),
+            discovered_at=datetime.now(timezone.utc),
+        )
+
 class UserProvidedSource(JobSource):
     """Allows the user to manually supply job postings (e.g. pasted job
     description + URL) instead of relying on any external scraping."""
