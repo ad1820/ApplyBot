@@ -65,8 +65,6 @@ Curious about the code? Here is the layout:
 
 ## ⚙️ Setup & Environment Variables
 
-If you're setting this up for the first time, copy `.env.example` to `.env` and fill in your keys. **Never commit your `.env` file!** 🛑
-
 Here are the most important ones:
 * `SUPABASE_URL` / `SUPABASE_KEY` - Connects to your free Supabase database.
 * `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` - Connects to your personal bot.
