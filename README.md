@@ -9,11 +9,12 @@ The system **never automatically submits applications** and **never stores or au
 ## 🌟 What makes this awesome? (Key Features)
 
 - 🧠 **Built-in Local ATS Checker**: No need to pay for resume scanners! Just send your resume to the bot, and whenever you see a job you like (via the `/resume` command), it acts like a strict ATS scanner. It tells you exactly what skills you're missing and drafts a tailored resume for you!
-- 🔀 **Smart AI Failovers**: We use free, powerful AI models (Google Gemini, NVIDIA NIM, Groq). If one model hits a rate limit, the bot smoothly switches to the next one so your job hunt never crashes. 
-- 🚫 **No Junk Jobs (Smart Filtering)**: The bot instantly throws away irrelevant roles (like "Senior", "Sales", or "Staff") before they even reach you, saving time and API tokens.
+- 🔀 **Quota-Aware AI Failovers**: Google Gemini, NVIDIA NIM, and Groq are arranged in fallback chains. Rolling request-per-minute limits and HTTP 429 cooldowns route work to the next available provider without repeatedly calling one that is already throttled.
+- 🚫 **Conservative Job Filtering**: Jobs must match one of your configured role families and pass fresher/experience, India/location, and minimum-score gates before reaching Telegram or Google Sheets. Rejected jobs are still saved in Supabase for history and auditing, but they do not consume semantic-matching quota when a deterministic gate already fails.
 - 📊 **Beautiful Google Sheets**: Every matched job is magically logged to a Master sheet *and* a daily tab (like `2026-08-25`), complete with auto-formatting, frozen headers, and color-coded styling. 
-- 🌍 **Tons of Open Sources**: Pulls seamlessly from dozens of open API job boards (Jobicy, Arbeitnow, RemoteOK, Remotive) and hundreds of private ATS company boards (Greenhouse, Lever, Ashby). No shady scraping required!
+- 🌍 **Broad API Coverage**: Jobicy, Arbeitnow, RemoteOK, Remotive, Working Nomads, Himalayas, and We Work Remotely are enabled by default, alongside configured Greenhouse, Lever, and Ashby company boards. No browser scraping is required.
 - 🛡️ **Crash-Proof**: If your computer goes to sleep mid-run, no worries! It picks up right where it left off without duplicating jobs.
+- 🔐 **Safer Operational Logging**: Structured logs redact sensitive fields, while low-level HTTP request logging is suppressed so Telegram and Gemini credentials embedded in request URLs are not written to the console or log files.
 
 ---
 
@@ -30,7 +31,7 @@ You -> scripts/run_discovery.py -> 💾 Supabase (Saves the jobs)
                                 -> 📱 Telegram (Pings you the best ones!)
 ```
 
-Each run scans public sources, scores them deterministically against your actual skills, and filters out the noise. You only get a Telegram ping for jobs that genuinely match your profile!
+Each run scans public sources, normalizes and deduplicates jobs, and stores every new posting in Supabase. Delivery is stricter: a job reaches Sheets and the prioritized Telegram digest only when it passes the configured role, fresher, location, and score gates. Optional LLM semantic skill matching runs only after the deterministic eligibility checks pass.
 
 ---
 
@@ -60,6 +61,7 @@ Curious about the code? Here is the layout:
 * `app/llm/` - The AI brain that routes between Gemini, Groq, and NVIDIA.
 * `app/sheets/` - The magic that keeps your spreadsheets looking pretty.
 * `tests/` - 200+ offline tests ensuring the bot never breaks! 🧪
+* `explanation/` - Module-by-module architecture notes, engineering decisions, and interview-oriented explanations.
 
 ---
 
@@ -72,4 +74,18 @@ Here are the most important ones:
 * `GROQ_MODELS` - Pass a comma-separated list of models (e.g., `openai/gpt-oss-120b,openai/gpt-oss-20b`) to bypass daily rate limits!
 * `MINIMUM_MATCH_SCORE` - Only jobs scoring above this (e.g. `80`) will ping your phone.
 
-For the practical step-by-step everyday workflow, check out **`DAILY_RUN.md`**. For a fuller local-setup walkthrough, see **`HOW_TO_RUN.md`**. Happy hunting! 🏹💼
+---
+
+## 🧹 Fresh-Start Reset
+
+To clear operational job-search history and rebuild the Google Sheet while preserving candidate profiles, job preferences, and master resumes:
+
+```powershell
+python scripts/reset_environment.py --confirm RESET
+```
+
+The explicit confirmation is required because the operation is destructive. It deletes tracked jobs and dependent application data in bounded batches, clears independent run/analytics records, attempts to remove Telegram messages whose IDs were recorded, recreates a clean `Jobs` sheet, and verifies the final database and workbook state. Telegram cannot enumerate arbitrary chat history and may reject deletion of older messages.
+
+---
+
+For the practical step-by-step everyday workflow, check out **`DAILY_RUN.md`**. For a fuller local-setup walkthrough, see **`HOW_TO_RUN.md`**. The module-by-module technical guide is in **`explanation/README.md`**. Happy hunting! 🏹💼
