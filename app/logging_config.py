@@ -74,6 +74,12 @@ def configure_logging(level: str = "INFO") -> None:
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
+    # httpx emits complete request URLs at INFO. Telegram and Gemini place
+    # credentials in those URLs, so their request lines must never reach the
+    # console or persistent application log.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)

@@ -57,4 +57,5 @@ class GroqProvider(OpenAICompatibleProvider):
             base_url=_API_URL,
             client=client,
             extra_request_fields=extra_fields,
+            rpm_limit=30,
         )

@@ -7,12 +7,17 @@ the LLM is unavailable the deterministic score is still fully usable.
 """
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from app.jobs.models import Job
-from app.jobs.skills_taxonomy import find_related_candidate_skill, normalize as _normalize_skill
+from app.jobs.skills_taxonomy import (
+    SKILL_CLUSTERS,
+    find_related_candidate_skill,
+    normalize as _normalize_skill,
+)
 
 
 @dataclass
@@ -25,30 +30,350 @@ class MatchResult:
     concerns: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class FresherFit:
+    """Deterministic fresher suitability used by scoring and notification gating."""
+
+    eligible: bool
+    entry_signal: bool
+    required_years: Optional[float] = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class LocationFit:
+    """Whether a posting is realistically open to an India-based candidate."""
+
+    eligible: bool
+    reason: str
+
+
 _ROLE_STOPWORDS = {"a", "an", "the", "of", "and", "or", "for", "in", "at", "to"}
+_ENGINEERING_WORDS = {"engineer", "engineering", "developer", "development"}
+
+# These are role-family aliases, not a global list of roles to search. They
+# only expand a role the candidate explicitly selected. This prevents a
+# Backend/Applied-AI candidate from matching QA, support, product, or data
+# analyst jobs merely because those happen to be common fresher titles.
+_ROLE_FAMILIES: dict[str, tuple[re.Pattern[str], ...]] = {
+    "entry_software": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\b(?:sde|swe)[-\s]?[01]\b",
+            r"\bgraduate\s+software\s+engineer\b",
+            r"\bentry[\s-]?level\s+software\s+engineer\b",
+            r"\bjunior\s+software\s+engineer\b",
+        )
+    ),
+    "software": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\bsoftware\s+(?:development\s+)?engineer\b",
+            r"\bsoftware\s+developer\b",
+            r"\b(?:sde|swe)(?:[-\s]?[01])?\b",
+            r"\bgraduate\s+software\s+engineer\b",
+        )
+    ),
+    "backend": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\bback[\s-]?end\s+(?:software\s+)?(?:engineer|developer)\b",
+            r"\bpython\s+(?:back[\s-]?end\s+)?(?:engineer|developer)\b",
+            r"\bapi\s+(?:platform\s+)?engineer\b",
+        )
+    ),
+    "applied_ai": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\bapplied\s+ai\b",
+            r"\b(?:generative\s+)?ai\s+(?:software\s+)?(?:engineer|developer)\b",
+            r"\b(?:llm|rag)\s+(?:engineer|developer)\b",
+            r"\bmachine\s+learning\s+(?:engineer|developer)\b",
+            r"\bml\s+(?:engineer|developer)\b",
+        )
+    ),
+    "full_stack": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\bfull[\s-]?stack\s+(?:engineer|developer)\b",
+            r"\bmern\s+(?:stack\s+)?(?:engineer|developer)\b",
+        )
+    ),
+    "site_reliability": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\bsite\s+reliability\s+engineer\b",
+            r"\bsre(?:[-\s]?[01])?\b",
+        )
+    ),
+    "quality": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\bqa\s+(?:automation\s+)?(?:engineer|developer|analyst)\b",
+            r"\bquality\s+assurance\s+(?:engineer|developer|analyst)\b",
+            r"\bsoftware\s+test(?:ing)?\s+engineer\b",
+            r"\btest\s+automation\s+engineer\b",
+            r"\bsdet(?:[-\s]?[01])?\b",
+        )
+    ),
+    "application": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\b(?:mobile\s+)?app(?:lication)?\s+(?:engineer|developer)\b",
+            r"\bios\s+(?:engineer|developer)\b",
+            r"\bandroid\s+(?:engineer|developer)\b",
+            r"\b(?:flutter|react\s+native)\s+(?:engineer|developer)\b",
+        )
+    ),
+}
 
 
 def _role_words(role: str) -> set[str]:
-    return {w for w in role.lower().split() if w not in _ROLE_STOPWORDS and len(w) > 2}
+    return {
+        w
+        for w in re.findall(r"[a-z0-9+#.]+", role.lower())
+        if w not in _ROLE_STOPWORDS and len(w) > 2
+    }
+
+
+def _role_family(role: str) -> Optional[str]:
+    normalized = " ".join(re.findall(r"[a-z0-9]+", role.lower()))
+    words = set(normalized.split())
+    if normalized in {
+        "sde 0", "sde 1", "swe 0", "swe 1", "graduate software engineer",
+        "entry level software engineer", "junior software engineer",
+    }:
+        return "entry_software"
+    if normalized in {
+        "sde", "swe", "software engineer",
+        "software developer", "software development engineer",
+    }:
+        return "software"
+    if "backend" in words or ("back" in words and "end" in words) or normalized.startswith("python backend"):
+        return "backend"
+    if normalized in {
+        "applied ai", "ai engineer", "llm engineer", "ml engineer",
+        "machine learning engineer",
+    }:
+        return "applied_ai"
+    if "full stack" in normalized or "fullstack" in words or "mern" in words:
+        return "full_stack"
+    if normalized in {"site reliability engineer", "sre", "sre 0", "sre 1"}:
+        return "site_reliability"
+    if normalized in {
+        "qa engineer", "qa automation engineer", "quality assurance engineer",
+        "software test engineer", "test automation engineer", "sdet", "sdet 1",
+    }:
+        return "quality"
+    if normalized in {
+        "application developer", "app developer", "mobile application developer",
+        "mobile app developer", "ios developer", "android developer",
+        "flutter developer", "react native developer",
+    }:
+        return "application"
+    return None
 
 
 def title_matches_preferred_roles(title: str, preferred_roles: list[str]) -> bool:
-    """Return True if the job title is a plausible match for at least one
-    preferred role, based on significant-word overlap (e.g. "Backend
-    Engineer" matches "Senior Backend Engineer II") rather than exact
-    string equality."""
+    """Return True only for an explicitly selected role family.
+
+    Known aliases (SDE/SWE, engineer/developer) are supported, but generic
+    overlap on words such as "engineer" is intentionally insufficient.
+    """
     title_words = _role_words(title)
+    normalized_title = " ".join(re.findall(r"[a-z0-9+#.]+", title.lower()))
     for role in preferred_roles:
+        family = _role_family(role)
+        if family and any(pattern.search(title) for pattern in _ROLE_FAMILIES[family]):
+            return True
+
         role_words = _role_words(role)
         if not role_words:
             continue
-        if role.lower() in title.lower() or title.lower() in role.lower():
+
+        normalized_role = " ".join(re.findall(r"[a-z0-9+#.]+", role.lower()))
+        if re.search(rf"(?<![a-z0-9]){re.escape(normalized_role)}(?![a-z0-9])", normalized_title):
             return True
-        # Majority of the role's significant words appear in the title.
-        overlap = role_words & title_words
-        if overlap and len(overlap) >= max(1, len(role_words) // 2):
+
+        # Generic roles require every meaningful word. Engineer/developer
+        # are interchangeable only when all specialization words match.
+        specialization = role_words - _ENGINEERING_WORDS
+        title_specialization = title_words - _ENGINEERING_WORDS
+        engineering_matches = bool(role_words & _ENGINEERING_WORDS) and bool(title_words & _ENGINEERING_WORDS)
+        if specialization and specialization <= title_specialization and (
+            engineering_matches or not (role_words & _ENGINEERING_WORDS)
+        ):
             return True
     return False
+
+
+def role_priority_for_title(title: str) -> int:
+    """Return the candidate's requested role tier (1 is highest priority)."""
+    normalized = " ".join(re.findall(r"[a-z0-9]+", title.lower()))
+    if (
+        re.search(r"\b(?:applied ai|ai backend|llm|rag)\b", normalized)
+        or re.search(r"\b(?:sde|swe)\s*[01]\b", normalized)
+    ):
+        return 1
+    if re.search(r"\bback(?:\s|-)?end\b", title, re.IGNORECASE):
+        return 2
+    if re.search(r"\b(?:graduate|entry\s*level|junior)\b", normalized) and re.search(
+        r"\bsoftware\s+(?:development\s+)?engineer\b", normalized
+    ):
+        return 3
+    if re.search(r"\bfull[\s-]?stack\b", title, re.IGNORECASE):
+        return 4
+    if any(
+        pattern.search(title)
+        for family in ("site_reliability", "quality", "application")
+        for pattern in _ROLE_FAMILIES[family]
+    ):
+        return 5
+    return 6
+
+
+_AMBIGUOUS_SHORT_SKILLS = {
+    "ai": "AI",
+    "c": "C",
+    "cv": "CV",
+    "eda": "EDA",
+    "go": "Go",
+    "js": "JS",
+    "llm": "LLM",
+    "ml": "ML",
+    "r": "R",
+    "rag": "RAG",
+    "sse": "SSE",
+    "ts": "TS",
+}
+
+
+def _plain_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(value or ""))).strip()
+
+
+def _mentions_skill(text: str, skill: str) -> bool:
+    """Match a skill as a token/phrase, never as an arbitrary substring."""
+    skill = skill.strip()
+    if not skill:
+        return False
+    normalized = _normalize_skill(skill)
+    if normalized in _AMBIGUOUS_SHORT_SKILLS:
+        display = _AMBIGUOUS_SHORT_SKILLS[normalized]
+        return bool(re.search(rf"(?<![A-Za-z0-9+#.]){re.escape(display)}(?![A-Za-z0-9+#.])", text))
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9+#.]){re.escape(skill)}(?![A-Za-z0-9+#.])",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _extract_description_skills(description: str, candidate_skills: set[str]) -> set[str]:
+    """Extract a conservative comparison set from unstructured ATS text."""
+    text = _plain_text(description)
+    vocabulary = set(candidate_skills)
+    for cluster in SKILL_CLUSTERS:
+        vocabulary.update(cluster)
+    return {skill for skill in vocabulary if _mentions_skill(text, skill)}
+
+
+_SENIOR_TITLE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bsenior\b", r"\bsr\.?\b", r"\bstaff\b", r"\bprincipal\b",
+        r"\blead\b", r"\bdirector\b", r"\bmanager\b", r"\barchitect\b",
+        r"\bhead\s+of\b", r"\bvp\b",
+        r"\b(?:engineer|developer|sde|swe)\s+(?:ii|iii|iv|2|3|4)\b",
+    )
+)
+_ENTRY_TITLE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bjunior\b", r"\bjr\.?\b", r"\bentry[\s-]?level\b",
+        r"\bgraduate\b", r"\bnew\s+grad\b", r"\btrainee\b",
+        r"\bfresher\b", r"\bintern(?:ship)?\b", r"\b(?:sde|swe)[-\s]?[01]\b",
+    )
+)
+_ENTRY_DESCRIPTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(?:fresh|recent|new)\s+graduate(?:s)?\b",
+        r"\bgraduate\s+(?:programme|program|role|position)\b",
+        r"\b0\s*(?:-|–|to)\s*[12]\s+years?\b",
+        r"\bno\s+(?:professional\s+)?experience\s+(?:is\s+)?required\b",
+        r"\b202[4-7]\s+(?:batch|graduate|graduation)\b",
+    )
+)
+_EXPERIENCE_PATTERN = re.compile(
+    r"(?<!\d)(?P<minimum>\d{1,2})(?:\s*(?:-|–|—|to)\s*(?P<maximum>\d{1,2}))?\s*\+?\s*"
+    r"(?:years?|yrs?)(?:\s+of)?(?:\s+(?:relevant|professional|industry|work|hands-on|commercial|software|engineering|development|technical))*\s+experience\b",
+    re.IGNORECASE,
+)
+
+
+def assess_fresher_fit(job: Job, profile: dict[str, Any], preferences: dict[str, Any]) -> FresherFit:
+    """Assess title seniority and explicit experience requirements."""
+    title = job.title or ""
+    description = _plain_text(" ".join(filter(None, (job.description, job.requirements))))
+    if any(pattern.search(title) for pattern in _SENIOR_TITLE_PATTERNS):
+        return FresherFit(False, False, reason=f"senior-level title is not fresher friendly: {title}")
+
+    entry_signal = any(pattern.search(title) for pattern in _ENTRY_TITLE_PATTERNS) or any(
+        pattern.search(description) for pattern in _ENTRY_DESCRIPTION_PATTERNS
+    )
+    requirements = [float(match.group("minimum")) for match in _EXPERIENCE_PATTERN.finditer(description)]
+    required_years = max(requirements) if requirements else None
+
+    configured_max = preferences.get("experience_max")
+    allowed_years = float(configured_max) if configured_max is not None else 1.0
+    if required_years is not None and required_years > allowed_years:
+        return FresherFit(
+            False,
+            entry_signal,
+            required_years,
+            f"Posting requires at least {required_years:g} years of experience (fresher limit: {allowed_years:g})",
+        )
+    if entry_signal:
+        return FresherFit(True, True, required_years, "Posting has an explicit entry-level/fresher/new-grad signal")
+    if required_years is not None:
+        return FresherFit(True, False, required_years, f"Experience requirement is within fresher range ({required_years:g} year minimum)")
+    return FresherFit(True, False, None, "No senior title or disqualifying experience requirement found")
+
+
+_GLOBAL_REMOTE_MARKERS = ("worldwide", "anywhere", "global", "all locations")
+_INDIA_LOCATION_MARKERS = (
+    "india", "bengaluru", "bangalore", "hyderabad", "pune", "mumbai", "delhi",
+    "gurgaon", "gurugram", "noida", "chennai", "kolkata", "indore", "goa",
+    "ahmedabad", "kochi", "ncr",
+)
+_FOREIGN_REGION_MARKERS = (
+    "united states", "usa", "u.s.", "canada", "europe", "emea", "uk", "united kingdom",
+    "australia", "new zealand", "latin america", "latam", "north america",
+)
+
+
+def assess_location_fit(job: Job) -> LocationFit:
+    """Treat remote as a work mode, not automatic worldwide eligibility."""
+    location = (job.location or "").strip().lower()
+    description = _plain_text(job.description or "").lower()
+    visa_keywords = (
+        "visa sponsorship", "sponsor visa", "will sponsor", "relocation assistance",
+        "relocation support", "visa support",
+    )
+    if any(marker in location for marker in _INDIA_LOCATION_MARKERS):
+        return LocationFit(True, f"Location/work mode compatible with India-based search: {job.location}")
+    if any(keyword in description for keyword in visa_keywords):
+        return LocationFit(True, "Posting mentions visa/relocation support")
+    if job.work_mode.value == "remote" or "remote" in location:
+        if not location or location == "remote" or any(marker in location for marker in _GLOBAL_REMOTE_MARKERS):
+            return LocationFit(True, f"Role is globally remote: {job.location or 'Remote'}")
+        if any(marker in location for marker in _FOREIGN_REGION_MARKERS):
+            return LocationFit(False, f"Remote role is geographically restricted: {job.location}")
+        if "remote" in location:
+            return LocationFit(True, f"Role is remote with no recognized exclusion: {job.location}")
+    return LocationFit(False, f"Location is not in India/global-remote and has no sponsorship signal: {job.location or 'unknown'}")
 
 
 def score_job(
@@ -75,11 +400,11 @@ def score_job(
     candidate_skills = {_normalize_skill(s) for s in profile.get("skills", [])}
     job_skills = {_normalize_skill(s) for s in job.skills}
 
-    # If the job posting didn't list explicit skills, fall back to scanning
-    # the description text for candidate skills mentioned there.
+    # If the job posting didn't list explicit skills, conservatively extract
+    # both candidate and taxonomy skills from the description. Looking only
+    # for candidate skills makes every detected skill look like a perfect fit.
     if not job_skills and job.description:
-        desc_lower = job.description.lower()
-        job_skills = {s for s in candidate_skills if s in desc_lower}
+        job_skills = _extract_description_skills(job.description, candidate_skills)
 
     exact_matches = sorted(candidate_skills & job_skills)
     remaining = job_skills - candidate_skills
@@ -102,11 +427,11 @@ def score_job(
     if job_skills:
         exact_credit = len(exact_matches)
         related_credit = len(related_matches) * 0.6
-        skills_component = ((exact_credit + related_credit) / len(job_skills)) * 50
+        skills_component = ((exact_credit + related_credit) / len(job_skills)) * 40
     else:
         # No skills data at all to compare - stay neutral rather than
         # penalizing or rewarding.
-        skills_component = 25.0
+        skills_component = 20.0
 
     reasons: list[str] = []
     concerns: list[str] = []
@@ -120,8 +445,9 @@ def score_job(
     preferred_roles = preferences.get("preferred_roles") or []
     if preferred_roles:
         if title_matches_preferred_roles(job.title, preferred_roles):
-            title_component = 20.0
-            reasons.append(f"Title matches a preferred role: {job.title}")
+            priority = role_priority_for_title(job.title)
+            title_component = {1: 25.0, 2: 23.0, 3: 22.0, 4: 20.0}.get(priority, 18.0)
+            reasons.append(f"Priority {priority} role match: {job.title}")
         else:
             title_component = 0.0
             concerns.append(
@@ -130,66 +456,37 @@ def score_job(
             )
     else:
         # No role preference configured - stay neutral.
-        title_component = 10.0
+        title_component = 12.5
 
-    # Location / visa relevance. Candidate is India-based: a job is
-    # relevant if it's located in India, OR it's remote (location-agnostic),
-    # OR the posting explicitly mentions visa/relocation sponsorship. Jobs
-    # that are onsite/hybrid in a country with no sponsorship signal and no
-    # India presence are penalized rather than excluded outright, since a
-    # posting may simply omit sponsorship info.
+    # Location / visa relevance. "Remote" describes work mode, not worldwide
+    # eligibility: US-only and Europe-only remote roles are not India fits.
     location_component = 0.0
-    location_text = (job.location or "").lower()
-    description_text = (job.description or "").lower()
-    is_india = "india" in location_text
-    is_remote_mode = job.work_mode.value == "remote"
-    mentions_remote_text = "remote" in location_text
-    visa_keywords = ("visa sponsorship", "sponsor visa", "will sponsor", "relocation assistance", "relocation support", "visa support")
-    mentions_visa = any(k in description_text for k in visa_keywords)
-
-    if is_india or is_remote_mode or mentions_remote_text:
+    location_fit = assess_location_fit(job)
+    if location_fit.eligible:
         location_component = 15.0
-        reasons.append(f"Location/work mode compatible with India-based remote work: {job.location or job.work_mode.value}")
-    elif mentions_visa:
-        location_component = 12.0
-        reasons.append("Posting mentions visa/relocation support")
+        reasons.append(location_fit.reason)
     else:
-        location_component = 0.0
-        concerns.append(
-            f"Location '{job.location or 'unknown'}' is not in India, not remote, and the posting "
-            "does not mention visa/relocation sponsorship"
-        )
+        concerns.append(location_fit.reason)
 
     # Seniority / fresher relevance. Candidate is a fresher, so senior-level
     # postings are penalized and entry-level/intern/graduate postings are
     # rewarded. Unlabeled postings stay neutral rather than being penalized,
     # since many entry-friendly roles don't explicitly say "junior".
     #
-    # Matching is restricted to the job TITLE (not the full description) and
-    # uses word-boundary regex, since keyword substrings inside a long
-    # description are unreliable (e.g. "intern" inside "internet", or a
-    # description merely mentioning "graduate" as an education requirement
-    # rather than describing the seniority of the role itself).
+    # Title seniority is combined with explicit experience requirements and
+    # carefully scoped new-grad signals from the description.
     seniority_component = 0.0
-    title_lower = job.title.lower()
-    senior_keywords = (r"senior", r"sr\.?", r"staff", r"principal", r"lead", r"director", r"vp", r"head of", r"manager")
-    entry_keywords = (r"junior", r"jr\.?", r"entry[\s-]?level", r"associate", r"intern(ship)?", r"graduate", r"new grad", r"trainee", r"fresher")
-
-    def _title_has_any(keywords: tuple[str, ...]) -> bool:
-        return any(re.search(rf"\b{kw}\b", title_lower) for kw in keywords)
-
-    is_senior = _title_has_any(senior_keywords)
-    is_entry = _title_has_any(entry_keywords)
-
-    if is_senior:
-        seniority_component = 0.0
-        concerns.append(f"Job title suggests a senior-level role ('{job.title}'), not suitable for a fresher")
-    elif is_entry:
+    fresher_fit = assess_fresher_fit(job, profile, preferences)
+    if not fresher_fit.eligible:
+        concerns.append(fresher_fit.reason)
+    elif fresher_fit.entry_signal:
         seniority_component = 15.0
-        reasons.append("Posting is explicitly entry-level/internship/graduate friendly")
+        reasons.append(fresher_fit.reason)
     else:
-        # Unlabeled - stay neutral rather than penalizing.
+        # Unknown/unlabelled roles remain possible, but rank below postings
+        # that explicitly welcome fresh graduates.
         seniority_component = 8.0
+        reasons.append(fresher_fit.reason)
 
     work_mode_component = 0.0
     preferred_work_mode = preferences.get("work_mode", "any")
@@ -200,16 +497,14 @@ def score_job(
     else:
         concerns.append(f"Work mode mismatch: job is {job.work_mode.value}, preferred {preferred_work_mode}")
 
-    salary_component = 0.0
+    # Salary is recorded as a reason/concern but not scored. Most fresher
+    # postings omit it, so missing salary data should not distort fit.
     minimum_salary = preferences.get("minimum_salary")
     if minimum_salary and job.salary_max:
         if job.salary_max >= minimum_salary:
-            salary_component = 5.0
             reasons.append("Salary range meets minimum expectation")
         else:
             concerns.append("Salary range may be below minimum expectation")
-    elif not minimum_salary:
-        salary_component = 5.0
 
     excluded_companies = {c.lower() for c in preferences.get("excluded_companies", [])}
     if job.company.lower() in excluded_companies:
@@ -228,7 +523,6 @@ def score_job(
         + location_component
         + seniority_component
         + work_mode_component
-        + salary_component
     )
     total = max(0.0, min(100.0, total))
 
@@ -254,9 +548,14 @@ def make_llm_semantic_skill_checker(llm_provider: Any) -> Callable[[str, set[str
     from app.llm.base import LLMError
     from app.llm.prompts import semantic_skill_check_prompt
 
+    cache: dict[tuple[str, tuple[str, ...]], Optional[str]] = {}
+
     def checker(job_skill: str, candidate_skills: set[str]) -> Optional[str]:
         if not candidate_skills:
             return None
+        cache_key = (_normalize_skill(job_skill), tuple(sorted(candidate_skills)))
+        if cache_key in cache:
+            return cache[cache_key]
         system, user = semantic_skill_check_prompt(job_skill, candidate_skills)
         try:
             # 5 tokens is enough for a plain "yes"/"no" from a non-reasoning
@@ -270,8 +569,12 @@ def make_llm_semantic_skill_checker(llm_provider: Any) -> Callable[[str, set[str
             response = llm_provider.complete(user, system=system, max_tokens=50)
         except LLMError:
             return None
-        if response and response.strip().lower().startswith("yes"):
+        normalized_response = response.strip().lower() if response else ""
+        if normalized_response.startswith("yes"):
+            cache[cache_key] = job_skill
             return job_skill
+        if normalized_response.startswith("no"):
+            cache[cache_key] = None
         return None
 
     return checker

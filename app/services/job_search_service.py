@@ -6,8 +6,8 @@ truth. Every operation here is written to be idempotent so re-running after
 a crash never duplicates jobs or notifications.
 
 Google Sheets is kept in sync with exactly what gets pushed to Telegram:
-only jobs that clear both the role-match filter and the minimum match
-score threshold are synced to Sheets or notified. Every job is still
+only jobs that clear role, fresher, location, and minimum-score filters are
+synced to Sheets or notified. Every job is still
 persisted in Supabase regardless of score (visible via /jobs), but Sheets
 and Telegram only ever show the same, genuinely strong matches.
 """
@@ -20,8 +20,13 @@ from app.db.repositories.notifications import NotificationRepository
 from app.db.repositories.runs import AgentRunRepository
 from app.jobs.deduplicator import compute_canonical_key
 from app.jobs.discovery import JobSource
-from app.jobs.fresher_roles import load_fresher_hiring_roles
-from app.jobs.matcher import score_job, title_matches_preferred_roles
+from app.jobs.matcher import (
+    assess_fresher_fit,
+    assess_location_fit,
+    role_priority_for_title,
+    score_job,
+    title_matches_preferred_roles,
+)
 from app.jobs.models import Job, JobStatus
 from app.logging_config import get_logger, log_event
 from app.telegram.bot import TelegramBot
@@ -62,8 +67,6 @@ class JobSearchService:
         last_error: Optional[str] = None
         notified_jobs: list[dict[str, Any]] = []
 
-        preferences = self._augment_preferred_roles(preferences)
-
         for source in self.sources:
             try:
                 raw_jobs = source.search_jobs(preferences)
@@ -92,23 +95,6 @@ class JobSearchService:
 
         return {"run_id": run_id, **counters, "error": last_error}
 
-    def _augment_preferred_roles(self, preferences: dict[str, Any]) -> dict[str, Any]:
-        """Broaden preferences["preferred_roles"] with the curated fresher
-        role phrases from fresher_hiring_roles.txt (see app.jobs.fresher_roles),
-        additively - never replacing whatever the user already configured -
-        so common India fresher-hiring title patterns (SDE, SDET, GET,
-        MTS-1, etc.) are recognized as matches even if not explicitly listed
-        in config/job_preferences.json. A copy is returned; the caller's
-        original preferences dict is left untouched.
-        """
-        fresher_roles = load_fresher_hiring_roles()
-        if not fresher_roles:
-            return preferences
-        existing = list(preferences.get("preferred_roles") or [])
-        existing_lower = {r.lower() for r in existing}
-        merged = existing + [r for r in fresher_roles if r.lower() not in existing_lower]
-        return {**preferences, "preferred_roles": merged}
-
     def _process_job(
         self,
         job: Job,
@@ -120,14 +106,6 @@ class JobSearchService:
     ) -> None:
         counters["jobs_found"] += 1
         
-        # Hard blocklist: never read/process/save jobs with these words in the title.
-        import re
-        blocklist = ["senior", "sales", "marketing", "staff", "principle", "principal"]
-        title_lower = job.title.lower()
-        if any(re.search(rf"\b{word}\b", title_lower) for word in blocklist):
-            log_event(logger, "info", "Job title contains blocklisted word - skipping entirely", run_id=run_id, title=job.title)
-            return
-
         canonical_key = compute_canonical_key(job.company, job.title, job.location, job.external_id)
         existing = self.job_repo.find_by_canonical_key(canonical_key)
 
@@ -136,7 +114,29 @@ class JobSearchService:
             self.job_source_repo.add_source(existing["id"], job.source, job.external_id, job.url)
             return
 
-        match = score_job(job, profile, preferences, semantic_skill_checker=self.semantic_skill_checker)
+        preferred_roles = preferences.get("preferred_roles") or []
+        role_matches = not preferred_roles or title_matches_preferred_roles(job.title, preferred_roles)
+
+        fresher_only = preferences.get(
+            "fresher_friendly_only",
+            float(profile.get("years_of_experience") or 0) <= 1,
+        )
+        fresher_fit = assess_fresher_fit(job, profile, preferences)
+        fresher_matches = not fresher_only or fresher_fit.eligible
+
+        preferred_locations = preferences.get("preferred_locations") or []
+        location_fit = assess_location_fit(job)
+        location_matches = not preferred_locations or location_fit.eligible
+
+        # Only spend LLM quota after the deterministic gates pass. Rejected
+        # jobs are still scored and persisted, but use deterministic matching
+        # exclusively so unrelated titles never consume provider RPM.
+        semantic_checker = (
+            self.semantic_skill_checker
+            if role_matches and fresher_matches and location_matches
+            else None
+        )
+        match = score_job(job, profile, preferences, semantic_skill_checker=semantic_checker)
         payload = {
             "external_id": job.external_id,
             "source": job.source,
@@ -165,8 +165,7 @@ class JobSearchService:
         counters["jobs_new"] += 1
         self.job_source_repo.add_source(created["id"], job.source, job.external_id, job.url)
 
-        preferred_roles = preferences.get("preferred_roles") or []
-        if preferred_roles and not title_matches_preferred_roles(job.title, preferred_roles):
+        if not role_matches:
             # Hard filter: the job is persisted (so it's still visible via
             # /jobs) but is not pushed as a Telegram notification and not
             # synced to Sheets, since its title doesn't match any role the
@@ -174,6 +173,22 @@ class JobSearchService:
             log_event(
                 logger, "info", "Job title does not match preferred roles - notification skipped",
                 run_id=run_id, job_id=created["id"], operation="role_filter", status="SKIPPED",
+            )
+            return
+
+        if not fresher_matches:
+            log_event(
+                logger, "info", "Job is not fresher friendly - notification skipped",
+                run_id=run_id, job_id=created["id"], operation="fresher_filter", status="SKIPPED",
+                reason=fresher_fit.reason,
+            )
+            return
+
+        if not location_matches:
+            log_event(
+                logger, "info", "Job is outside candidate location eligibility - notification skipped",
+                run_id=run_id, job_id=created["id"], operation="location_filter", status="SKIPPED",
+                reason=location_fit.reason,
             )
             return
 
@@ -220,6 +235,7 @@ class JobSearchService:
         """
         if not notified_jobs or not self.telegram_bot or not self.telegram_chat_id:
             return
+        notified_jobs.sort(key=lambda job: role_priority_for_title(job.get("title") or ""))
         text, markup = format_company_digest(notified_jobs)
         try:
             response = self.telegram_bot.send_message(self.telegram_chat_id, text, reply_markup=markup)
@@ -232,4 +248,3 @@ class JobSearchService:
             for job in notified_jobs:
                 self.notification_repo.mark_failed(job["id"], str(exc))
             log_event(logger, "error", "telegram digest notification failed", run_id=run_id, error=str(exc))
-

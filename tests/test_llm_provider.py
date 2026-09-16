@@ -78,6 +78,17 @@ def test_openai_provider_raises_llm_transient_error_on_429():
         provider.complete("hello")
 
 
+def test_429_preserves_retry_after_for_chain_cooldown():
+    def handler(request):
+        return httpx.Response(429, headers={"Retry-After": "12"}, json={"error": "slow down"})
+
+    provider = OpenAIProvider(api_key="fake", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(LLMTransientError) as exc_info:
+        provider.complete("hello")
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retry_after == 12
+
+
 def test_openai_provider_raises_non_transient_llm_error_on_401():
     provider = OpenAIProvider(api_key="bad-key", client=_status_client(401))
     with pytest.raises(LLMError) as exc_info:
@@ -313,6 +324,35 @@ def test_provider_chain_fails_over_on_transient_error():
     b = _make_provider("b", reply="b-reply")
     chain = ProviderChain([a, b])
     assert chain.complete("hi") == "b-reply"
+
+
+def test_provider_chain_routes_around_rolling_rpm_limit():
+    primary = _make_provider("primary", reply="primary")
+    primary.rpm_limit = 1
+    fallback = _make_provider("fallback", reply="fallback")
+    clock = lambda: 100.0
+    chain = ProviderChain([primary, fallback], clock=clock)
+
+    assert chain.complete("first") == "primary"
+    assert chain.complete("second") == "fallback"
+    assert len(primary.calls) == 1
+
+
+def test_provider_chain_cools_down_provider_after_429():
+    primary = _make_provider("primary")
+    calls = []
+
+    def rate_limited(prompt, *, system=None, max_tokens=512):
+        calls.append(prompt)
+        raise LLMTransientError("limited", status_code=429, retry_after=30)
+
+    primary.complete = rate_limited
+    fallback = _make_provider("fallback", reply="fallback")
+    chain = ProviderChain([primary, fallback], clock=lambda: 100.0)
+
+    assert chain.complete("first") == "fallback"
+    assert chain.complete("second") == "fallback"
+    assert calls == ["first"]
 
 
 def test_provider_chain_does_not_fail_over_on_permanent_error():

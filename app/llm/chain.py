@@ -24,6 +24,8 @@ job matcher) always receive a valid (possibly empty) response.
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from typing import Any, Optional
 
 from app.llm.base import LLMError, LLMProvider, LLMTransientError
@@ -42,11 +44,14 @@ class ProviderChain(LLMProvider):
     so implementation bugs surface clearly -- they are not silently swallowed.
     """
 
-    def __init__(self, providers: list[LLMProvider]):
+    def __init__(self, providers: list[LLMProvider], *, clock=None):
         if not providers:
             self._providers: list[LLMProvider] = [_NULL]
         else:
             self._providers = providers
+        self._clock = clock or time.monotonic
+        self._request_history: dict[int, deque[float]] = {}
+        self._cooldown_until: dict[int, float] = {}
 
     @property
     def name(self) -> str:  # type: ignore[override]
@@ -55,11 +60,48 @@ class ProviderChain(LLMProvider):
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
+    def _reserve_provider_capacity(self, provider: LLMProvider) -> bool:
+        """Reserve a rolling-RPM slot or immediately route to a fallback."""
+        now = self._clock()
+        key = id(provider)
+        cooldown_until = self._cooldown_until.get(key, 0.0)
+        if now < cooldown_until:
+            logger.info(
+                "Skipping LLM provider during rate-limit cooldown",
+                extra={
+                    "extra_fields": {
+                        "provider": provider.name,
+                        "cooldown_seconds": round(cooldown_until - now, 1),
+                    }
+                },
+            )
+            return False
+
+        rpm_limit = getattr(provider, "rpm_limit", None)
+        if not rpm_limit:
+            return True
+
+        history = self._request_history.setdefault(key, deque())
+        cutoff = now - 60.0
+        while history and history[0] <= cutoff:
+            history.popleft()
+        if len(history) >= rpm_limit:
+            self._cooldown_until[key] = history[0] + 60.0
+            logger.info(
+                "Skipping LLM provider at rolling RPM limit",
+                extra={"extra_fields": {"provider": provider.name, "rpm_limit": rpm_limit}},
+            )
+            return False
+        history.append(now)
+        return True
+
     def _try_providers(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """Call `method` on each provider in order, failing over on transient
         errors only. Returns the first successful result."""
         last_exc: Optional[Exception] = None
         for provider in self._providers:
+            if not self._reserve_provider_capacity(provider):
+                continue
             try:
                 # Log which provider is handling this request
                 logger.info(
@@ -75,6 +117,9 @@ class ProviderChain(LLMProvider):
                 )
                 return result
             except LLMTransientError as exc:
+                if exc.status_code == 429:
+                    cooldown = exc.retry_after if exc.retry_after is not None else 60.0
+                    self._cooldown_until[id(provider)] = self._clock() + max(1.0, cooldown)
                 logger.warning(
                     "LLM provider transient failure: provider=%s method=%s error=%s"
                     " — trying next provider",

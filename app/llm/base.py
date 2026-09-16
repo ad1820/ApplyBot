@@ -25,6 +25,17 @@ class LLMTransientError(LLMError):
     (401 / 403), or response-parsing bugs — those are non-retryable and should
     be surfaced as plain LLMError so they are not silently swallowed."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 
 class LLMProvider(ABC):
     name: str = "base"

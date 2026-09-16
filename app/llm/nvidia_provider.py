@@ -34,4 +34,5 @@ class NvidiaNIMProvider(OpenAICompatibleProvider):
             base_url=_API_URL,
             client=client,
             extra_request_fields={"chat_template_kwargs": {"enable_thinking": False}},
+            rpm_limit=40,
         )

@@ -34,7 +34,14 @@ class FakeTelegramBot:
         return {"result": {"message_id": len(self.sent)}}
 
 
-def build_service(fake_client, jobs, telegram_bot=None, sheets_sync_fn=None, minimum_match_score=0.0):
+def build_service(
+    fake_client,
+    jobs,
+    telegram_bot=None,
+    sheets_sync_fn=None,
+    minimum_match_score=0.0,
+    semantic_skill_checker=None,
+):
     # minimum_match_score defaults to 0 here so these restart/recovery tests
     # exercise idempotency logic independent of scoring thresholds; the
     # threshold behavior itself is covered by dedicated tests below.
@@ -48,6 +55,7 @@ def build_service(fake_client, jobs, telegram_bot=None, sheets_sync_fn=None, min
         telegram_chat_id="123" if telegram_bot else None,
         sheets_sync_fn=sheets_sync_fn,
         minimum_match_score=minimum_match_score,
+        semantic_skill_checker=semantic_skill_checker,
     )
 
 
@@ -176,6 +184,20 @@ def test_mismatched_role_job_persisted_but_not_notified(fake_client):
     job_repo = JobRepository(fake_client)
     stored = job_repo.list_recent()[0]
     assert stored["status"] == "DISCOVERED"  # never moved to NOTIFIED
+
+
+def test_mismatched_role_does_not_consume_llm_quota(fake_client):
+    calls = []
+
+    def checker(job_skill, candidate_skills):
+        calls.append(job_skill)
+        return None
+
+    job = sample_job(title="Account Executive", skills=["rust"])
+    service = build_service(fake_client, [job], semantic_skill_checker=checker)
+    service.run({"skills": ["python"]}, {"preferred_roles": ["Backend Engineer"]})
+
+    assert calls == []
 
 
 def test_matching_role_job_still_notified(fake_client):
@@ -312,20 +334,50 @@ def test_no_matching_jobs_sends_no_digest(fake_client):
     assert bot.sent == []
 
 
-def test_fresher_hiring_roles_are_merged_into_preferred_roles(fake_client, tmp_path, monkeypatch):
-    """A job whose title matches a fresher_hiring_roles.txt phrase (but not
-    anything explicitly listed in preferences) must still be notified."""
-    roles_file = tmp_path / "fresher_hiring_roles.txt"
-    roles_file.write_text("Software Development Engineer (SDE)\n", encoding="utf-8")
-    monkeypatch.setattr("app.jobs.fresher_roles._ROLES_FILE", roles_file)
-
+def test_unselected_fresher_role_does_not_broaden_candidate_search(fake_client):
+    """Generic fresher titles must not override the candidate's role choices."""
     bot = FakeTelegramBot()
     job = sample_job(title="SDE", location="India", skills=["python"])
     service = build_service(fake_client, [job], telegram_bot=bot, minimum_match_score=0.0)
 
-    # preferences only lists an unrelated role - "SDE" only matches via the
-    # fresher_hiring_roles.txt augmentation.
     result = service.run({"skills": ["python"]}, {"preferred_roles": ["Data Scientist"]})
 
-    assert result["jobs_notified"] == 1
-    assert len(bot.sent) == 1
+    assert result["jobs_notified"] == 0
+    assert len(bot.sent) == 0
+
+
+def test_experience_requirement_above_fresher_limit_is_not_notified(fake_client):
+    bot = FakeTelegramBot()
+    job = sample_job(
+        title="Backend Engineer",
+        location="India",
+        skills=["python"],
+        description="Requires 3+ years of professional experience.",
+    )
+    service = build_service(fake_client, [job], telegram_bot=bot, minimum_match_score=0.0)
+
+    result = service.run(
+        {"skills": ["python"], "years_of_experience": 0.33},
+        {"preferred_roles": ["Backend Engineer"], "fresher_friendly_only": True, "experience_max": 1},
+    )
+
+    assert result["jobs_new"] == 1
+    assert result["jobs_notified"] == 0
+
+
+def test_region_restricted_remote_role_is_not_notified(fake_client):
+    bot = FakeTelegramBot()
+    job = sample_job(
+        title="Backend Engineer",
+        location="Remote - United States",
+        skills=["python"],
+    )
+    service = build_service(fake_client, [job], telegram_bot=bot, minimum_match_score=0.0)
+
+    result = service.run(
+        {"skills": ["python"], "years_of_experience": 0.33},
+        {"preferred_roles": ["Backend Engineer"], "preferred_locations": ["India", "Remote"]},
+    )
+
+    assert result["jobs_new"] == 1
+    assert result["jobs_notified"] == 0

@@ -1,4 +1,11 @@
-from app.jobs.matcher import apply_llm_boost, score_job
+from app.jobs.matcher import (
+    apply_llm_boost,
+    assess_fresher_fit,
+    assess_location_fit,
+    role_priority_for_title,
+    score_job,
+    title_matches_preferred_roles,
+)
 from app.jobs.models import Job, WorkMode
 
 
@@ -89,7 +96,7 @@ def test_score_job_rewards_matching_role_title_variants():
 
     result = score_job(job, profile, preferences)
 
-    assert any("Title matches a preferred role" in r for r in result.matching_reasons)
+    assert any("role match" in r for r in result.matching_reasons)
 
 
 def test_score_job_neutral_when_no_preferred_roles_configured():
@@ -167,7 +174,7 @@ def test_india_location_scores_well_for_location_component():
 def test_remote_job_scores_well_regardless_of_country():
     job = make_job(location="San Francisco, USA", work_mode=WorkMode.REMOTE)
     result = score_job(job, {"skills": []}, {})
-    assert any("compatible with India-based" in r for r in result.matching_reasons)
+    assert any("geographically restricted" in c for c in result.concerns)
 
 
 def test_onsite_non_india_no_visa_mention_is_penalized():
@@ -225,3 +232,85 @@ def test_seniority_word_boundary_does_not_match_substrings_in_title():
     job = make_job(title="Engagement Manager")
     result = score_job(job, {"skills": []}, {})
     assert any("senior-level" in c for c in result.concerns)
+
+
+def test_role_match_requires_the_specialization_not_just_engineer_word():
+    preferences = ["Backend Engineer", "Software Engineer"]
+    assert title_matches_preferred_roles("Backend Developer", preferences)
+    assert title_matches_preferred_roles("Software Development Engineer I", preferences)
+    assert not title_matches_preferred_roles("Design Engineer (Web & Brand)", preferences)
+    assert not title_matches_preferred_roles("Technical Support Engineer", preferences)
+
+
+def test_short_skills_do_not_match_inside_ordinary_words():
+    job = make_job(
+        skills=[],
+        description="Own business processes and storage systems while assessing customer needs.",
+    )
+    result = score_job(job, {"skills": ["C", "SSE", "RAG"]}, {})
+    assert result.matching_skills == []
+
+
+def test_explicit_two_year_requirement_is_not_fresher_friendly():
+    job = make_job(description="Applicants must have 2+ years of professional experience.")
+    fit = assess_fresher_fit(job, {"years_of_experience": 0.33}, {"experience_max": 1})
+    assert not fit.eligible
+    assert fit.required_years == 2
+
+
+def test_zero_to_two_year_range_is_fresher_friendly():
+    job = make_job(description="This role is intended for candidates with 0-2 years of experience.")
+    fit = assess_fresher_fit(job, {"years_of_experience": 0.33}, {"experience_max": 1})
+    assert fit.eligible
+    assert fit.entry_signal
+
+
+def test_remote_country_restriction_is_not_global_remote():
+    job = make_job(location="Remote - United States", work_mode=WorkMode.REMOTE)
+    assert not assess_location_fit(job).eligible
+
+
+def test_requested_role_priority_sequence():
+    assert role_priority_for_title("Applied AI Engineer") == 1
+    assert role_priority_for_title("SDE-1, Payments") == 1
+    assert role_priority_for_title("JavaScript Backend Developer") == 2
+    assert role_priority_for_title("Graduate Software Engineer") == 3
+    assert role_priority_for_title("Full-Stack Engineer, AI Product") == 4
+    assert role_priority_for_title("Junior Site Reliability Engineer") == 5
+
+
+def test_fresher_adjacent_role_families_are_supported():
+    preferences = [
+        "Site Reliability Engineer",
+        "QA Engineer",
+        "Application Developer",
+        "iOS Developer",
+    ]
+    assert title_matches_preferred_roles("SRE-1", preferences)
+    assert title_matches_preferred_roles("QA Automation Engineer", preferences)
+    assert title_matches_preferred_roles("Mobile Application Developer", preferences)
+    assert title_matches_preferred_roles("Junior iOS Developer", preferences)
+
+
+def test_semantic_skill_checker_caches_repeated_decisions():
+    from app.jobs.matcher import make_llm_semantic_skill_checker
+
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, *args, **kwargs):
+            self.calls += 1
+            return "no"
+
+    provider = Provider()
+    checker = make_llm_semantic_skill_checker(provider)
+    skills = {"python", "fastapi"}
+    assert checker("rust", skills) is None
+    assert checker("rust", skills) is None
+    assert provider.calls == 1
+
+
+def test_sde1_preference_does_not_match_unlabelled_software_engineer():
+    assert title_matches_preferred_roles("SDE-1", ["SDE-1"])
+    assert not title_matches_preferred_roles("Software Engineer, Payments", ["SDE-1"])

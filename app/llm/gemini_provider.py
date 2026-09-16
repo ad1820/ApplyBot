@@ -44,6 +44,7 @@ class GeminiProvider(LLMProvider):
         self.api_key = api_key
         self.model = model
         self.name = f"gemini:{model}"
+        self.rpm_limit = 15
         self._client = client or httpx.Client(timeout=30.0)
 
     def _url(self) -> str:

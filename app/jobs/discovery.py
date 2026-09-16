@@ -81,8 +81,15 @@ class GreenhouseSource(JobSource):
         )
 
 
-def _parse_datetime(value: str | None) -> datetime | None:
+def _parse_datetime(value: Any) -> datetime | None:
     if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    if not isinstance(value, str):
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -409,15 +416,26 @@ class WeWorkRemotelySource(JobSource):
 
 
 class JobicySource(JobSource):
-    """Uses Jobicy's public API: https://jobicy.com/api/v2/remote-jobs"""
+    """Uses Jobicy's public, no-auth remote jobs API."""
+
     name = "jobicy"
-    def __init__(self, industry: str = "engineering", client: httpx.Client | None = None):
+
+    def __init__(
+        self,
+        count: int = 200,
+        industry: str | None = None,
+        client: httpx.Client | None = None,
+    ):
+        self.count = max(1, min(count, 200))
         self.industry = industry
         self._client = client or httpx.Client(timeout=15.0)
 
     def search_jobs(self, preferences: dict[str, Any]) -> list[Job]:
+        params: dict[str, Any] = {"count": self.count}
+        if self.industry:
+            params["industry"] = self.industry
         try:
-            response = self._client.get("https://jobicy.com/api/v2/remote-jobs", params={"industry": self.industry})
+            response = self._client.get("https://jobicy.com/api/v2/remote-jobs", params=params)
             response.raise_for_status()
             data = response.json()
         except (httpx.HTTPError, ValueError):
@@ -434,9 +452,13 @@ class JobicySource(JobSource):
             work_mode=WorkMode.REMOTE,
             description=raw.get("jobDescription") or "",
             url=raw.get("url"),
+            salary_min=raw.get("salaryMin"),
+            salary_max=raw.get("salaryMax"),
+            currency=raw.get("salaryCurrency"),
             posted_at=_parse_datetime(raw.get("pubDate")),
             discovered_at=datetime.now(timezone.utc),
         )
+
 
 class ArbeitnowSource(JobSource):
     """Uses Arbeitnow's public API: https://www.arbeitnow.com/api/job-board-api"""
@@ -462,7 +484,7 @@ class ArbeitnowSource(JobSource):
             company=raw.get("company_name", "Unknown"),
             title=raw.get("title", "Unknown Title"),
             location=location,
-            work_mode=WorkMode.REMOTE if raw.get("remote") else WorkMode.HYBRID,
+            work_mode=WorkMode.REMOTE if raw.get("remote") else WorkMode.ONSITE,
             description=raw.get("description") or "",
             skills=[str(t) for t in tags],
             url=raw.get("url"),

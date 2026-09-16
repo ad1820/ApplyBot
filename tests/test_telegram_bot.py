@@ -96,3 +96,27 @@ def test_send_message_includes_reply_markup_when_provided():
     bot = make_bot(handler)
     bot.send_message("123", "hello", reply_markup={"inline_keyboard": [[]]})
     assert captured["body"]["reply_markup"] == {"inline_keyboard": [[]]}
+
+
+def test_delete_messages_calls_batch_endpoint_with_ids():
+    captured = {}
+
+    def handler(request):
+        import json
+
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    bot = make_bot(handler)
+    result = bot.delete_messages("123", [4, 5, 6])
+
+    assert result["result"] is True
+    assert "deleteMessages" in captured["url"]
+    assert captured["body"] == {"chat_id": "123", "message_ids": [4, 5, 6]}
+
+
+def test_delete_messages_rejects_more_than_100_ids():
+    bot = make_bot(lambda request: httpx.Response(200, json={"ok": True, "result": True}))
+    with pytest.raises(TelegramError):
+        bot.delete_messages("123", list(range(101)))

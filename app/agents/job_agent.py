@@ -17,9 +17,11 @@ from app.db.repositories.profiles import CandidateProfileRepository, JobPreferen
 from app.db.repositories.runs import AgentRunRepository
 from app.db.supabase import get_supabase_client
 from app.jobs.discovery import (
+    ArbeitnowSource,
     AshbySource,
     GreenhouseSource,
     HimalayasSource,
+    JobicySource,
     JobSource,
     LeverSource,
     RemoteOKSource,
@@ -101,6 +103,8 @@ def default_sources(
     remote-friendly roles.
     """
     sources: list[JobSource] = [
+        JobicySource(),
+        ArbeitnowSource(),
         RemoteOKSource(),
         RemotiveSource(),
         WorkingNomadsSource(),

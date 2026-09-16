@@ -58,6 +58,22 @@ class TelegramBot:
         response.raise_for_status()
         return response.json()
 
+    def delete_messages(self, chat_id: str, message_ids: list[int]) -> dict[str, Any]:
+        """Delete up to 100 known messages from a chat.
+
+        Telegram does not expose chat-history listing to bots and normally
+        permits deletion only within 48 hours. Callers must therefore pass
+        message IDs that the application recorded when sending them.
+        """
+        if not message_ids:
+            return {"ok": True, "result": True}
+        if len(message_ids) > 100:
+            raise TelegramError("delete_messages accepts at most 100 message IDs")
+        payload = {"chat_id": chat_id, "message_ids": message_ids}
+        response = self._client.post(f"{self._base_url}/deleteMessages", json=payload)
+        response.raise_for_status()
+        return response.json()
+
     def get_updates(self, offset: Optional[int] = None, timeout: int = 30) -> dict[str, Any]:
         """Long-poll for new updates.
 

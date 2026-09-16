@@ -6,9 +6,11 @@ import json
 
 from app.agents.job_agent import default_sources, load_cached_ats_boards
 from app.jobs.discovery import (
+    ArbeitnowSource,
     AshbySource,
     GreenhouseSource,
     HimalayasSource,
+    JobicySource,
     LeverSource,
     RemoteOKSource,
     RemotiveSource,
@@ -53,6 +55,8 @@ def test_default_sources_always_includes_aggregator_sources(monkeypatch, tmp_pat
     assert WorkingNomadsSource in names
     assert HimalayasSource in names
     assert WeWorkRemotelySource in names
+    assert JobicySource in names
+    assert ArbeitnowSource in names
 
 
 def test_default_sources_merges_explicit_and_cached_boards(monkeypatch, tmp_path):

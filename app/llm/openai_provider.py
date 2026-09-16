@@ -44,8 +44,18 @@ def _raise_for_status(response: httpx.Response, provider_name: str) -> None:
         return
     code = response.status_code
     if code in _TRANSIENT_STATUS_CODES:
+        retry_after: float | None = None
+        if code == 429:
+            raw_retry_after = response.headers.get("Retry-After")
+            if raw_retry_after:
+                try:
+                    retry_after = max(0.0, float(raw_retry_after))
+                except ValueError:
+                    retry_after = None
         raise LLMTransientError(
-            f"{provider_name} transient HTTP {code} — will try next provider"
+            f"{provider_name} transient HTTP {code} — will try next provider",
+            status_code=code,
+            retry_after=retry_after,
         )
     raise LLMError(
         f"{provider_name} non-retryable HTTP {code} — check API key / request format"
@@ -80,12 +90,14 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: str = _API_URL,
         client: httpx.Client | None = None,
         extra_request_fields: Optional[dict[str, Any]] = None,
+        rpm_limit: int | None = None,
     ):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self._client = client or httpx.Client(timeout=30.0)
         self.extra_request_fields = extra_request_fields or {}
+        self.rpm_limit = rpm_limit
 
     def complete(self, prompt: str, *, system: Optional[str] = None, max_tokens: int = 512) -> str:
         messages = []

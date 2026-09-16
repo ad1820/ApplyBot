@@ -5,8 +5,10 @@ from __future__ import annotations
 import httpx
 
 from app.jobs.discovery import (
+    ArbeitnowSource,
     AshbySource,
     HimalayasSource,
+    JobicySource,
     LeverSource,
     RemoteOKSource,
     RemotiveSource,
@@ -149,3 +151,45 @@ def test_ashby_source_normalizes():
 def test_ashby_source_handles_failure_gracefully():
     source = AshbySource(company_slugs=["nope"], client=make_client(status=404, json_response={}))
     assert source.search_jobs({}) == []
+
+
+def test_jobicy_source_normalizes_public_api_response():
+    data = {
+        "jobs": [{
+            "id": 10,
+            "jobTitle": "Junior iOS Developer",
+            "companyName": "Acme",
+            "jobGeo": "APAC",
+            "jobDescription": "Build mobile apps",
+            "url": "https://jobicy.com/jobs/10",
+            "pubDate": "2026-09-01T00:00:00Z",
+            "salaryMin": 50000,
+            "salaryMax": 70000,
+            "salaryCurrency": "USD",
+        }]
+    }
+    source = JobicySource(client=make_client(json_response=data))
+    jobs = source.search_jobs({})
+    assert len(jobs) == 1
+    assert jobs[0].title == "Junior iOS Developer"
+    assert jobs[0].work_mode == WorkMode.REMOTE
+    assert jobs[0].salary_min == 50000
+
+
+def test_arbeitnow_source_handles_epoch_timestamp():
+    data = {
+        "data": [{
+            "slug": "qa-engineer-acme",
+            "company_name": "Acme",
+            "title": "QA Engineer",
+            "description": "Test APIs",
+            "remote": True,
+            "url": "https://arbeitnow.com/jobs/qa-engineer-acme",
+            "created_at": 1789500000,
+        }]
+    }
+    source = ArbeitnowSource(client=make_client(json_response=data))
+    jobs = source.search_jobs({})
+    assert len(jobs) == 1
+    assert jobs[0].posted_at is not None
+    assert jobs[0].work_mode == WorkMode.REMOTE
